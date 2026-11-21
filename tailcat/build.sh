@@ -1,14 +1,17 @@
 #!/bin/sh
-# Builds libtailcat (the upstream C ABI, cmd/libtailcat) as static archives
-# from the pinned upstream revision, with upstream's release build tags.
+# Builds Wuhu's tailcat bridge (tailcat/wuhu, C ABI wuhu_tailcat.h) as static
+# archives against the pinned upstream revision, with upstream's release build
+# tags. The bridge is compiled as cmd/wuhutailcat inside the upstream module,
+# which it uses only through the public tailcat package.
 #
-#   tailcat/build.sh apple <out>   CTailcat.xcframework via upstream's swift/Makefile (macOS, Xcode)
-#   tailcat/build.sh linux <out>   x86_64-linux-gnu c-archive (glibc)
+#   tailcat/build.sh apple <out>   CTailcat.xcframework, arm64 macOS/iOS/iOS simulator (macOS, Xcode)
+#   tailcat/build.sh linux <out>   x86_64-linux-gnu c-archive (glibc), after the bridge's tests
 #
 # Needs the Go toolchain go.mod names (GOTOOLCHAIN=local) and a C compiler.
 set -eu
 
-. "$(dirname "$0")/pin.env"
+here=$(cd "$(dirname "$0")" && pwd)
+. "$here/pin.env"
 
 kind=$1
 out=$(mkdir -p "$2" && cd "$2" && pwd)
@@ -20,29 +23,45 @@ curl -fsSL "https://github.com/tailscale/tailcat/archive/$COMMIT.tar.gz" -o "$so
 echo "$SOURCE_SHA256  $source_tarball" | shasum -a 256 -c -
 tar -xzf "$source_tarball" -C "$work"
 src="$work/tailcat-$COMMIT"
+mkdir "$src/cmd/wuhutailcat"
+cp "$here"/wuhu/*.go "$src/cmd/wuhutailcat/"
 
 want=$(sed -n 's/^go //p' "$src/go.mod")
 have=$(GOTOOLCHAIN=local go env GOVERSION)
 [ "$have" = "go$want" ] || { echo "go.mod wants go$want, have $have" >&2; exit 1; }
 export GOTOOLCHAIN=local CGO_ENABLED=1 GOFLAGS=-trimpath
+tags=$(cat "$src/build-tags.txt")
 
 stage="$work/stage"
-mkdir -p "$stage"
-cp "$src/LICENSE" "$stage/LICENSE"
-cp "$(dirname "$0")/PROVENANCE.md" "$stage/PROVENANCE.md"
+mkdir -p "$stage/include"
+cp "$src/LICENSE" "$here/PROVENANCE.md" "$stage/"
+cp "$here/wuhu/wuhu_tailcat.h" "$here/wuhu/module.modulemap" "$stage/include/"
+
+# archive <slice> <goos> <goarch> <cc> <tags> <ldflags>
+archive() {
+  (cd "$src" && GOOS=$2 GOARCH=$3 CC=$4 go build -buildmode=c-archive -tags "$5" -ldflags "$6" \
+    -o "$work/$1/libtailcat.a" ./cmd/wuhutailcat)
+}
 
 case "$kind" in
 apple)
-  make -C "$src/swift" xcframework
-  cp -R "$src/swift/CTailcat.xcframework" "$stage/"
-  (cd "$stage" && zip -qry "$out/tailcat-$VERSION-apple.zip" .)
+  (export MACOSX_DEPLOYMENT_TARGET=14.0 CGO_CFLAGS=-mmacos-version-min=14.0 CGO_LDFLAGS=-mmacos-version-min=14.0 &&
+    archive macos darwin arm64 clang "$tags" "-s -w")
+  archive ios ios arm64 "$src/swift/script/clangwrap-ios.sh" "ios,$tags" -w
+  archive iossim ios arm64 "$src/swift/script/clangwrap-ios-sim-arm.sh" "ios,$tags" -w
+  xcodebuild -create-xcframework \
+    -library "$work/macos/libtailcat.a" -headers "$stage/include" \
+    -library "$work/ios/libtailcat.a" -headers "$stage/include" \
+    -library "$work/iossim/libtailcat.a" -headers "$stage/include" \
+    -output "$work/apple/CTailcat.xcframework"
+  cp "$src/LICENSE" "$here/PROVENANCE.md" "$work/apple/"
+  (cd "$work/apple" && zip -qry "$out/tailcat-$VERSION-apple.zip" .)
   ;;
 linux)
-  mkdir -p "$stage/include" "$stage/lib"
-  (cd "$src" && go build -buildmode=c-archive -tags "$(cat build-tags.txt)" \
-    -ldflags "-s -w" -o "$work/libtailcat.a" ./cmd/libtailcat)
-  cp "$work/libtailcat.a" "$stage/lib/"
-  cp "$src/cmd/libtailcat/tailcat.h" "$src/swift/include/module.modulemap" "$stage/include/"
+  (cd "$src" && go test -count=1 -timeout 300s ./cmd/wuhutailcat)
+  archive linux linux amd64 cc "$tags" "-s -w"
+  mkdir -p "$stage/lib"
+  cp "$work/linux/libtailcat.a" "$stage/lib/"
   tar -czf "$out/tailcat-$VERSION-linux-x86_64.tar.gz" -C "$stage" .
   ;;
 *)

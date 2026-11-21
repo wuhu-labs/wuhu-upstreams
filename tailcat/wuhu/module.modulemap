@@ -1,0 +1,4 @@
+module CTailcat {
+    header "wuhu_tailcat.h"
+    export *
+}
