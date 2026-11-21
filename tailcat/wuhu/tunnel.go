@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/tailscale/tailcat"
@@ -26,66 +27,75 @@ import (
 
 const (
 	servicePort  = 443
-	startTimeout = 30 * time.Second
 	drainTimeout = time.Second
-	maxOpen      = 512
+	maxStreams   = 512
 )
 
 // Variables so tests can shorten them.
 var (
 	dialTimeout = 10 * time.Second
 	headTimeout = 10 * time.Second
+	lockPoll    = 100 * time.Millisecond
 )
 
-// owner closes everything registered with it, at most maxOpen things at once, and refuses registrations once closed.
-type owner struct {
+// streams owns open streams, each an accepted connection and the connection it is spliced to: at most maxStreams, all
+// closed by close.
+type streams struct {
 	mu     sync.Mutex
 	closed bool
-	open   map[io.Closer]struct{}
+	open   map[net.Conn]net.Conn
 }
 
-func (o *owner) add(c io.Closer) bool {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if o.closed || len(o.open) >= maxOpen {
+// admit takes c as a new stream, or closes it when full or closed.
+func (s *streams) admit(c net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || len(s.open) >= maxStreams {
 		c.Close()
 		return false
 	}
-	if o.open == nil {
-		o.open = map[io.Closer]struct{}{}
+	if s.open == nil {
+		s.open = map[net.Conn]net.Conn{}
 	}
-	o.open[c] = struct{}{}
+	s.open[c] = nil
 	return true
 }
 
-func (o *owner) remove(c io.Closer) {
-	o.mu.Lock()
-	delete(o.open, c)
-	o.mu.Unlock()
+// splice runs upstream's ProxyConns between the admitted c and up: each end of stream travels on as a half-close, and
+// gVisor's FIN drains before the close.
+func (s *streams) splice(c, up net.Conn) {
+	s.mu.Lock()
+	live := !s.closed
+	if live {
+		s.open[c] = up
+	}
+	s.mu.Unlock()
+	if live {
+		tailcat.ProxyConns(c, up)
+	}
+	up.Close()
+	s.drop(c)
 }
 
-func (o *owner) Close() error {
-	o.mu.Lock()
-	o.closed = true
-	open := o.open
-	o.open = nil
-	o.mu.Unlock()
-	for c := range open {
+func (s *streams) drop(c net.Conn) {
+	c.Close()
+	s.mu.Lock()
+	delete(s.open, c)
+	s.mu.Unlock()
+}
+
+func (s *streams) close() {
+	s.mu.Lock()
+	s.closed = true
+	open := s.open
+	s.open = nil
+	s.mu.Unlock()
+	for c, up := range open {
 		c.Close()
+		if up != nil {
+			up.Close()
+		}
 	}
-	return nil
-}
-
-// splice runs upstream's ProxyConns: each end of stream travels on as a half-close, and gVisor's FIN drains before
-// the close.
-func (o *owner) splice(a, b net.Conn) {
-	if o.add(a) && o.add(b) {
-		tailcat.ProxyConns(a, b)
-	}
-	a.Close()
-	b.Close()
-	o.remove(a)
-	o.remove(b)
 }
 
 type identity struct {
@@ -136,12 +146,14 @@ func createIdentity(path string) error {
 }
 
 type node struct {
-	owner
 	server   *tailcat.Server
+	identity *os.File
+	streams  streams
 	stop     context.CancelFunc
 	stopped  context.Context
-	starting sync.Mutex
+	mu       sync.Mutex
 	started  bool
+	ln       net.Listener
 }
 
 func newNode(identityPath, regionPath string) (*node, error) {
@@ -157,44 +169,50 @@ func newNode(identityPath, regionPath string) (*node, error) {
 	if json.Unmarshal(text, &region) != nil || region.RegionID == 0 || len(region.Nodes) == 0 {
 		return nil, fmt.Errorf("%s holds no DERP region", regionPath)
 	}
-	n := &node{server: &tailcat.Server{Key: id.PrivateKey, PresharedKey: id.PresharedKey, Region: &region, Logf: logger.Discard}}
+	file, err := os.Open(identityPath)
+	if err != nil {
+		return nil, err
+	}
+	n := &node{server: &tailcat.Server{Key: id.PrivateKey, PresharedKey: id.PresharedKey, Region: &region, Logf: logger.Discard}, identity: file}
 	n.stopped, n.stop = context.WithCancel(context.Background())
 	return n, nil
 }
 
-// Close ends the node's connections and lets their FINs reach the clients before the node leaves tailcat; a client
-// whose stream just vanished would wait on it forever.
+// Close ends the node's streams and lets their FINs reach the clients before the node leaves tailcat (a client whose
+// stream just vanished would wait on it forever), then hands the identity to the next node waiting for it.
 func (n *node) Close() error {
 	n.stop()
-	n.starting.Lock()
-	defer n.starting.Unlock()
-	n.owner.Close()
-	if n.started {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.streams.close()
+	if n.ln != nil {
+		n.ln.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
 		defer cancel()
 		n.server.DrainTCP(ctx)
 	}
-	return n.server.Close()
+	err := n.server.Close()
+	n.identity.Close()
+	return err
 }
 
-// forward joins tailcat and splices each connection a client opens to the service port to a fresh connection to
-// host:port. It returns the node's address.
+// forward joins tailcat once no other node holds the identity, and splices each connection a client opens to the
+// service port to a fresh connection to host:port. It returns the node's address.
 func (n *node) forward(host string, port uint16) (string, error) {
-	n.starting.Lock()
-	defer n.starting.Unlock()
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	if n.started || n.stopped.Err() != nil {
 		return "", errors.New("tailcat: node is closed or already forwards")
 	}
-	ctx, cancel := context.WithTimeout(n.stopped, startTimeout)
-	defer cancel()
-	ln, err := n.server.Listen(ctx, "tcp", fmt.Sprintf(":%d", servicePort))
+	n.started = true
+	if err := n.lock(); err != nil {
+		return "", err
+	}
+	ln, err := n.server.Listen(n.stopped, "tcp", fmt.Sprintf(":%d", servicePort))
 	if err != nil {
 		return "", err
 	}
-	if !n.add(ln) {
-		return "", net.ErrClosed
-	}
-	n.started = true
+	n.ln = ln
 	target := net.JoinHostPort(host, strconv.Itoa(int(port)))
 	go func() {
 		for {
@@ -202,39 +220,86 @@ func (n *node) forward(host string, port uint16) (string, error) {
 			if err != nil {
 				return
 			}
-			if !n.add(c) {
-				continue
+			if n.streams.admit(c) {
+				go func() {
+					if up, err := net.DialTimeout("tcp", target, dialTimeout); err == nil {
+						n.streams.splice(c, up)
+					} else {
+						n.streams.drop(c)
+					}
+				}()
 			}
-			go func() {
-				local, err := net.DialTimeout("tcp", target, dialTimeout)
-				if err != nil {
-					c.Close()
-					n.remove(c)
-					return
-				}
-				n.splice(c, local)
-			}()
 		}
 	}()
 	return string(n.server.TailcatAddr()), nil
 }
 
+// lock waits for the identity file's exclusive lock: two nodes with one key would contend for its relay home.
+func (n *node) lock() error {
+	for {
+		err := syscall.Flock(int(n.identity.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if !errors.Is(err, syscall.EWOULDBLOCK) {
+			return err
+		}
+		select {
+		case <-n.stopped.Done():
+			return net.ErrClosed
+		case <-time.After(lockPoll):
+		}
+	}
+}
+
+// check dials the forwarding node's own address the way a client does.
+func (n *node) check(timeout time.Duration) error {
+	n.mu.Lock()
+	forwarding := n.ln != nil
+	n.mu.Unlock()
+	if !forwarding {
+		return errors.New("tailcat: node does not forward")
+	}
+	c := &tailcat.Client{Server: n.server.TailcatAddr(), Logf: logger.Discard}
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(n.stopped, timeout)
+	defer cancel()
+	conn, err := c.DialTCPPort(ctx, servicePort)
+	if err == nil {
+		conn.Close()
+	}
+	return err
+}
+
 type dialer func() (conn net.Conn, release func(), err error)
 
 type proxy struct {
-	owner
 	authority, authorization string
 	client                   *client
 	port                     uint16
+	streams                  streams
+	mu                       sync.Mutex
+	closed                   bool
+	ln                       net.Listener
 }
 
 func newProxy(address, authority, credential string) (*proxy, error) {
-	if _, err := tailcat.ParseAddr(tailcat.Addr(address)); err != nil {
+	info, err := tailcat.ParseAddr(tailcat.Addr(address))
+	if err != nil {
 		return nil, err
 	}
-	p := &proxy{authority: authority, authorization: "Basic " + credential}
-	p.client = &client{owner: &p.owner, open: func() peer { return &tailcat.Client{Server: tailcat.Addr(address), Logf: logger.Discard} }}
+	p := &proxy{authority: authority, authorization: "Basic " + credential, client: &client{relays: info.Region, open: func() peer {
+		return &tailcat.Client{Server: tailcat.Addr(address), Logf: logger.Discard}
+	}}}
 	return p, p.listen(p.client.dial)
+}
+
+func (p *proxy) Close() error {
+	p.mu.Lock()
+	p.closed = true
+	ln := p.ln
+	p.mu.Unlock()
+	ln.Close()
+	p.streams.close()
+	p.client.close()
+	return nil
 }
 
 func (p *proxy) listen(dial dialer) error {
@@ -242,10 +307,7 @@ func (p *proxy) listen(dial dialer) error {
 	if err != nil {
 		return err
 	}
-	p.port = uint16(ln.Addr().(*net.TCPAddr).Port)
-	if !p.add(ln) {
-		return net.ErrClosed
-	}
+	p.port, p.ln = uint16(ln.Addr().(*net.TCPAddr).Port), ln
 	go p.accept(ln, dial)
 	return nil
 }
@@ -254,16 +316,23 @@ func (p *proxy) accept(ln net.Listener, dial dialer) {
 	for {
 		c, err := ln.Accept()
 		if err == nil {
-			if p.add(c) {
+			if p.streams.admit(c) {
 				go p.tunnel(c, dial)
 			}
 			continue
 		}
-		p.remove(ln)
 		ln.Close()
 		// iOS reclaims a suspended app's listening sockets; the same port serves again once the app runs.
 		time.Sleep(100 * time.Millisecond)
-		if ln, err = net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(p.port)))); err != nil || !p.add(ln) {
+		p.mu.Lock()
+		if !p.closed {
+			if ln, err = net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(p.port)))); err == nil {
+				p.ln = ln
+			}
+		}
+		closed := p.closed
+		p.mu.Unlock()
+		if closed || err != nil {
 			return
 		}
 	}
@@ -293,8 +362,7 @@ func (p *proxy) tunnel(c net.Conn, dial dialer) {
 	}
 	if status != "" {
 		fmt.Fprintf(c, "HTTP/1.1 %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", status)
-		c.Close()
-		p.remove(c)
+		p.streams.drop(c)
 		return
 	}
 	c.SetReadDeadline(time.Time{})
@@ -305,11 +373,10 @@ func (p *proxy) tunnel(c net.Conn, dial dialer) {
 	}
 	if err != nil {
 		up.Close()
-		c.Close()
-		p.remove(c)
+		p.streams.drop(c)
 		return
 	}
-	p.splice(c, up)
+	p.streams.splice(c, up)
 }
 
 type peer interface {
@@ -318,100 +385,100 @@ type peer interface {
 	Close() error
 }
 
-// client reaches one tailcat server through a peer. A restarted server forgets the peers that registered with it, so a
-// failed dial on a peer that dialed before replaces the peer and is retried once. The replaced peer carries its open
-// streams until they end or the next replacement.
+// client reaches one tailcat server through a peer. A restarted server forgets the peers registered with it, so a
+// failed dial retires its peer and is tried once more on a fresh one; a retired peer closes when its last lease ends.
 type client struct {
-	owner            *owner
-	open             func() peer
-	mu               sync.Mutex
-	current, retired *entry
+	open    func() peer
+	relays  []*tailcfg.DERPRegion
+	mu      sync.Mutex
+	closed  bool
+	current *entry
+	peers   map[*entry]struct{}
 }
 
 type entry struct {
 	peer
-	streams   int
-	succeeded bool
+	leases int
 }
 
-func (c *client) get() (*entry, error) {
+func (c *client) lease() (*entry, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.current == nil {
-		e := &entry{peer: c.open()}
-		if !c.owner.add(e.peer) {
-			return nil, net.ErrClosed
-		}
-		c.current = e
+	if c.closed {
+		return nil, net.ErrClosed
 	}
+	if c.current == nil {
+		c.current = &entry{peer: c.open()}
+		if c.peers == nil {
+			c.peers = map[*entry]struct{}{}
+		}
+		c.peers[c.current] = struct{}{}
+	}
+	c.current.leases++
 	return c.current, nil
 }
 
-func (c *client) dial() (net.Conn, func(), error) {
-	for attempt := 0; ; attempt++ {
-		e, err := c.get()
-		if err != nil {
-			return nil, nil, err
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
-		conn, err := e.DialTCPPort(ctx, servicePort)
-		cancel()
-		c.mu.Lock()
-		if err == nil {
-			e.succeeded = true
-			e.streams++
-			c.mu.Unlock()
-			return conn, sync.OnceFunc(func() { c.release(e) }), nil
-		}
-		if c.current == e && e.succeeded {
-			c.retire(e)
-		}
-		retry := attempt == 0 && c.current != e
-		c.mu.Unlock()
-		if !retry {
-			return nil, nil, err
-		}
-	}
-}
-
-// retire takes e out of service and closes the peer retired before it; c.mu is held.
-func (c *client) retire(e *entry) {
-	if c.retired != nil {
-		c.close(c.retired)
-	}
-	c.current, c.retired = nil, e
-	if e.streams == 0 {
-		c.close(e)
-	}
-}
-
-func (c *client) release(e *entry) {
+func (c *client) release(e *entry, failed bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	e.streams--
-	if e == c.retired && e.streams == 0 {
-		c.close(e)
+	e.leases--
+	if failed && c.current == e {
+		c.current = nil
+	}
+	if c.current != e && e.leases == 0 && !c.closed {
+		delete(c.peers, e)
+		go e.Close()
 	}
 }
 
-func (c *client) close(e *entry) {
-	if c.retired == e {
-		c.retired = nil
+func (c *client) dial() (net.Conn, func(), error) {
+	var err error
+	for range 2 {
+		e, leaseErr := c.lease()
+		if leaseErr != nil {
+			return nil, nil, leaseErr
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+		var conn net.Conn
+		conn, err = e.DialTCPPort(ctx, servicePort)
+		cancel()
+		if err == nil {
+			return conn, sync.OnceFunc(func() { c.release(e, false) }), nil
+		}
+		c.release(e, true)
 	}
-	c.owner.remove(e.peer)
-	go e.Close()
+	return nil, nil, err
 }
 
-func (c *client) direct(timeout time.Duration) (bool, error) {
-	e, err := c.get()
+func (c *client) close() {
+	c.mu.Lock()
+	c.closed = true
+	peers := c.peers
+	c.current, c.peers = nil, nil
+	c.mu.Unlock()
+	for e := range peers {
+		e.Close()
+	}
+}
+
+// route pings the server: direct, or relayed through the relay host the address names for the path, when it names
+// exactly one.
+func (c *client) route(timeout time.Duration) (direct bool, relay string, err error) {
+	e, err := c.lease()
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
+	defer c.release(e, false)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	r, err := e.DiscoPing(ctx)
-	if err != nil {
-		return false, err
+	if err != nil || r.Endpoint != "" {
+		return err == nil, "", err
 	}
-	return r.Endpoint != "", nil
+	for _, region := range c.relays {
+		if (region.RegionID == r.DERPRegionID || len(c.relays) == 1) && len(region.Nodes) == 1 {
+			relay = region.Nodes[0].HostName
+		}
+	}
+	return false, relay, nil
 }

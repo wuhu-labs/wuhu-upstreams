@@ -63,7 +63,7 @@ func TestNodeRejectsMissingRegion(t *testing.T) {
 
 // fakeProxy serves the CONNECT protocol with dial in place of tailcat.
 func fakeProxy(t *testing.T, dial dialer) *proxy {
-	p := &proxy{authority: "space.test:443", authorization: "Basic " + credential}
+	p := &proxy{authority: "space.test:443", authorization: "Basic " + credential, client: &client{}}
 	if err := p.listen(dial); err != nil {
 		t.Fatal(err)
 	}
@@ -146,10 +146,11 @@ func (f *fakePeer) DialTCPPort(context.Context, uint16) (net.Conn, error) {
 func (f *fakePeer) DiscoPing(context.Context) (*ipnstate.PingResult, error) { return nil, nil }
 func (f *fakePeer) Close() error                                            { close(f.closed); return nil }
 
-func TestClientRetiresAForgottenPeerAfterItsStreams(t *testing.T) {
+func TestClientRetiresAFailedPeerAfterItsLeases(t *testing.T) {
 	var peers []*fakePeer
-	c := &client{owner: &owner{}, open: func() peer {
-		p := &fakePeer{closed: make(chan struct{})}
+	failing := false
+	c := &client{open: func() peer {
+		p := &fakePeer{fail: failing, closed: make(chan struct{})}
 		peers = append(peers, p)
 		return p
 	}}
@@ -169,10 +170,13 @@ func TestClientRetiresAForgottenPeerAfterItsStreams(t *testing.T) {
 	release()
 	<-peers[0].closed
 
-	peers[1].fail = true
-	c.current.succeeded = false
-	if _, _, err := c.dial(); err == nil || len(peers) != 2 {
-		t.Fatal("replaced a peer that never dialed")
+	peers[1].fail, failing = true, true
+	if _, _, err := c.dial(); err == nil || len(peers) != 3 {
+		t.Fatalf("two attempts: %v, %d peers", err, len(peers))
+	}
+	<-peers[2].closed
+	if len(c.peers) != 1 {
+		t.Fatalf("%d peers kept", len(c.peers))
 	}
 }
 
@@ -243,6 +247,9 @@ func TestPinnedHTTPSAndStreamsThroughTailcat(t *testing.T) {
 	if body, err := get(pinned); err != nil || body != "hello example.com" {
 		t.Fatalf("pinned GET: %q, %v", body, err)
 	}
+	if err := old.check(5 * time.Second); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := get(viaProxy(p, &tls.Config{ServerName: "example.com"})); err == nil {
 		t.Fatal("unpinned client trusted the server")
 	}
@@ -258,11 +265,20 @@ func TestPinnedHTTPSAndStreamsThroughTailcat(t *testing.T) {
 		t.Fatal("proxy tunneled another authority")
 	}
 
+	next := make(chan *node)
+	go func() { next <- restart() }()
+	select {
+	case <-next:
+		t.Fatal("a second node joined with the identity held")
+	case <-time.After(3 * lockPoll):
+	}
 	old.Close()
 	if _, err := io.ReadAll(events); err == nil {
 		t.Fatal("stream outlived its node")
 	}
-	restart()
+	if err := (<-next).check(5 * time.Second); err != nil {
+		t.Fatal(err)
+	}
 	fresh := viaProxy(p, &tls.Config{RootCAs: server.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs, ServerName: "example.com"})
 	if body, err := get(fresh); err != nil || body != "hello example.com" {
 		t.Fatalf("GET after restart: %q, %v", body, err)
@@ -280,7 +296,7 @@ func TestHalfCloseAndRouteThroughTailcat(t *testing.T) {
 	if echoed, err := io.ReadAll(r); err != nil || string(echoed) != body {
 		t.Fatalf("echoed %d bytes, %v", len(echoed), err)
 	}
-	if _, err := p.client.direct(5 * time.Second); err != nil {
+	if _, _, err := p.client.route(5 * time.Second); err != nil {
 		t.Fatal(err)
 	}
 

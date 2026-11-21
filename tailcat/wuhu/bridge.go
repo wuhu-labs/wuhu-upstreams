@@ -52,6 +52,13 @@ func wt_node_forward(h C.uintptr_t, host *C.char, port C.uint16_t, address **C.c
 	})
 }
 
+//export wt_node_check
+func wt_node_check(h C.uintptr_t, timeoutMS C.int64_t) *C.char {
+	return call(func() error {
+		return cgo.Handle(h).Value().(*node).check(time.Duration(timeoutMS) * time.Millisecond)
+	})
+}
+
 //export wt_proxy
 func wt_proxy(address, authority, credential *C.char, out *C.uintptr_t, port *C.uint16_t) *C.char {
 	return call(func() error {
@@ -64,12 +71,15 @@ func wt_proxy(address, authority, credential *C.char, out *C.uintptr_t, port *C.
 }
 
 //export wt_proxy_route
-func wt_proxy_route(h C.uintptr_t, timeoutMS C.int64_t, direct *C.int32_t) *C.char {
+func wt_proxy_route(h C.uintptr_t, timeoutMS C.int64_t, direct *C.int32_t, relay **C.char) *C.char {
 	return call(func() error {
-		d, err := cgo.Handle(h).Value().(*proxy).client.direct(time.Duration(timeoutMS) * time.Millisecond)
-		*direct = 0
+		d, r, err := cgo.Handle(h).Value().(*proxy).client.route(time.Duration(timeoutMS) * time.Millisecond)
+		*direct, *relay = 0, nil
 		if d {
 			*direct = 1
+		}
+		if r != "" {
+			*relay = C.CString(r)
 		}
 		return err
 	})

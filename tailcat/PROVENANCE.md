@@ -10,7 +10,7 @@ Static archives of Wuhu's tailcat bridge, built by `tailcat/build.sh` in github.
 
 ## The bridge
 
-`wuhu_tailcat.h` is the whole ABI: a node (`wt_node`, `wt_node_forward`) that joins tailcat and splices each client stream to one local TCP endpoint, and a loopback HTTP CONNECT proxy (`wt_proxy`, `wt_proxy_route`) that tunnels one authority, behind one credential, to one tailcat server. Each handle owns its listeners, peers and connections; `wt_close` ends them all. Streams are spliced by upstream's `ProxyConns` (half-close, FIN drain).
+`wuhu_tailcat.h` is the whole ABI: a node (`wt_node`, `wt_node_forward`, `wt_node_check`) that joins tailcat once it holds an exclusive lock on its identity file, splices each client stream to one local TCP endpoint and can dial itself through the relay, and a loopback HTTP CONNECT proxy (`wt_proxy`, `wt_proxy_route`) that tunnels one authority, behind one credential, to one tailcat server. Each handle owns its listeners, peers and connections; `wt_close` ends them all. Streams are spliced by upstream's `ProxyConns` (half-close, FIN drain).
 
 ## Artifacts
 
