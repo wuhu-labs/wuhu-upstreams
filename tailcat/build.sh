@@ -1,11 +1,10 @@
 #!/bin/sh
 # Builds Wuhu's tailcat bridge (tailcat/wuhu, C ABI wuhu_tailcat.h) as static
-# archives against the pinned upstream revision, with upstream's release build
-# tags. The bridge is compiled as cmd/wuhutailcat inside the upstream module,
-# which it uses only through the public tailcat package.
+# archives against the pinned fork revision, with upstream's release build
+# tags. The bridge is compiled as cmd/wuhutailcat inside the Tailcat module using public Tailcat and Tailscale APIs.
 #
 #   tailcat/build.sh apple <out>   CTailcat.xcframework, arm64 macOS/iOS/iOS simulator (macOS, Xcode)
-#   tailcat/build.sh linux <out>   x86_64-linux-gnu c-archive (glibc), after the bridge's tests
+#   tailcat/build.sh linux <out>   native x86_64 or arm64 Linux c-archive (glibc), after the bridge's tests
 #
 # Needs the Go toolchain go.mod names (GOTOOLCHAIN=local) and a C compiler.
 set -eu
@@ -19,7 +18,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 source_tarball="$out/tailcat-$VERSION-source.tar.gz"
-curl -fsSL "https://github.com/tailscale/tailcat/archive/$COMMIT.tar.gz" -o "$source_tarball"
+curl -fsSL "https://github.com/wuhu-labs/tailcat/archive/$COMMIT.tar.gz" -o "$source_tarball"
 echo "$SOURCE_SHA256  $source_tarball" | shasum -a 256 -c -
 tar -xzf "$source_tarball" -C "$work"
 src="$work/tailcat-$COMMIT"
@@ -58,11 +57,19 @@ apple)
   (cd "$work/apple" && zip -qry "$out/tailcat-$VERSION-apple.zip" .)
   ;;
 linux)
-  (cd "$src" && go test -count=1 -timeout 300s ./cmd/wuhutailcat)
-  archive linux linux amd64 cc "$tags" "-s -w"
+  arch=$(go env GOHOSTARCH)
+  case "$arch" in
+    amd64) slice=x86_64 ;;
+    arm64) slice=arm64 ;;
+    *) echo "unsupported Linux architecture: $arch" >&2; exit 2 ;;
+  esac
+  archive linux linux "$arch" cc "$tags" "-s -w"
+  cc -std=c11 -Wall -Wextra -Werror -pthread -I"$stage/include" \
+    "$here/wuhu/testdata/abi_smoke.c" "$work/linux/libtailcat.a" -o "$work/abi-smoke"
+  (cd "$src" && TAILCAT_ABI_SMOKE="$work/abi-smoke" go test -count=1 -timeout 300s ./cmd/wuhutailcat)
   mkdir -p "$stage/lib"
   cp "$work/linux/libtailcat.a" "$stage/lib/"
-  tar -czf "$out/tailcat-$VERSION-linux-x86_64.tar.gz" -C "$stage" .
+  tar -czf "$out/tailcat-$VERSION-linux-$slice.tar.gz" -C "$stage" .
   ;;
 *)
   echo "usage: $0 apple|linux <out>" >&2
