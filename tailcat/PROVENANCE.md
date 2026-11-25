@@ -3,8 +3,8 @@
 Static archives of Wuhu's Tailcat bridge, built by `tailcat/build.sh` in github.com/wuhu-labs/wuhu-upstreams against [wuhu-labs/tailcat](https://github.com/wuhu-labs/tailcat) at the revision in `tailcat/pin.env`.
 
 - Upstream base: e99a945255293ae97402680526172e0b4bbd7d1b (v0.7.0 plus 45 commits).
-- Fork commit: a68ed208b6b6f0017b9f14bbc1848248164a2ecc. It adds `Server.Dial` on the configured DERP region, adds the listener's path-discovery key to the meow reply, and refreshes the handshake before retrying a timed-out stream to a known peer. `Client` is unchanged.
-- Source: `https://github.com/wuhu-labs/tailcat/archive/<commit>.tar.gz`, SHA-256 618dadee35be4ec856a7eeaa9fdbdbfeb8597e7da3673bf6297929233cfe8c1c, republished byte-for-byte as the release's `-source.tar.gz`.
+- Fork commit: 9dcefe50cbcc0a38b31dbf0d3a58c05b9e8b7b54. It adds `Server.Dial` on the configured DERP region, adds the listener's path-discovery key to the meow reply, and refreshes the handshake before retrying a timed-out stream to a known peer. `Client` is unchanged.
+- Source: `https://github.com/wuhu-labs/tailcat/archive/<commit>.tar.gz`, SHA-256 d9911919d1aac0995eea47de5922a797a363ac5d0f16b1be9a9f2789d6d52c7c, republished byte-for-byte as the release's `-source.tar.gz`.
 - License: BSD-3-Clause (`LICENSE`, shipped in every artifact).
 - The first-party bridge (`tailcat/wuhu`) is added to the unpacked source as `cmd/wuhutailcat`. It uses public Tailcat and Tailscale APIs. Tailscale is unmodified, and the build tags are Tailcat's `build-tags.txt`.
 - Go: the toolchain `go.mod` names (1.27.4), `CGO_ENABLED=1`, `-trimpath`.
