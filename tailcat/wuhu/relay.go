@@ -111,6 +111,8 @@ func (r *derpRelay) startWatcher(presence peerPresence) error {
 	clientConn, serverConn := net.Pipe()
 	r.watch = clientConn
 	r.startConn(serverConn)
+	startup := time.AfterFunc(10*time.Second, func() { clientConn.Close() })
+	defer startup.Stop()
 	client, err := derp.NewClient(key.NewNode(), clientConn, relayBuffers(clientConn), logger.Discard, derp.MeshKey(r.server.MeshKey()))
 	if err != nil {
 		return err
@@ -121,6 +123,18 @@ func (r *derpRelay) startWatcher(presence peerPresence) error {
 	}
 	if err := client.WatchConnectionChanges(); err != nil {
 		return err
+	}
+	// Before we hand out the relay, wait for the watcher's own entry in
+	// the initial snapshot. A short-lived client can't come and go before
+	// DERP has registered the watcher.
+	for {
+		msg, err := client.Recv()
+		if err != nil {
+			return err
+		}
+		if m, ok := msg.(derp.PeerPresentMessage); ok && m.Key == client.PublicKey() {
+			break
+		}
 	}
 	r.wg.Go(func() {
 		present := make(map[key.NodePublic]bool)
