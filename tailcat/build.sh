@@ -63,8 +63,10 @@ linux)
     arm64) slice=arm64 ;;
     *) echo "unsupported Linux architecture: $arch" >&2; exit 2 ;;
   esac
-  (cd "$src" && go test -count=1 -timeout 300s ./cmd/wuhutailcat)
   archive linux linux "$arch" cc "$tags" "-s -w"
+  cc -std=c11 -Wall -Wextra -Werror -pthread -I"$stage/include" \
+    "$here/wuhu/testdata/abi_smoke.c" "$work/linux/libtailcat.a" -o "$work/abi-smoke"
+  (cd "$src" && TAILCAT_ABI_SMOKE="$work/abi-smoke" go test -count=1 -timeout 300s ./cmd/wuhutailcat)
   mkdir -p "$stage/lib"
   cp "$work/linux/libtailcat.a" "$stage/lib/"
   tar -czf "$out/tailcat-$VERSION-linux-$slice.tar.gz" -C "$stage" .

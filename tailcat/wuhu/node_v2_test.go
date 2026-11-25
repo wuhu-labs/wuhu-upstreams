@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,19 @@ import (
 )
 
 func TestNodeKeyConversion(t *testing.T) {
+	// RFC 8032 §7.1, TEST 1. The X25519 scalar is the clamped first
+	// half of SHA-512(seed); the public result also agrees with the
+	// Edwards-to-Montgomery map u = (1+y)/(1-y) mod (2^255-19).
+	seed := hexKey(t, "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+	ed := hexKey(t, "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+	wantPrivate := hexKey(t, "307c83864f2833cb427a2ef1c00a013cfdff2768d980c0a3a520f006904de94f")
+	wantPublic := hexKey(t, "d85e07ec22b0ad881537c2f44d662d1a143cf830c57aca4305d85c7a90f6b62e")
+	if got := nodePrivateKey(seed).Raw32(); got != wantPrivate {
+		t.Fatalf("converted RFC 8032 seed = %x; want %x", got, wantPrivate)
+	}
+	if got, err := nodePublicKey(ed); err != nil || got.Raw32() != wantPublic {
+		t.Fatalf("converted RFC 8032 public key = %x, %v; want %x", got.Raw32(), err, wantPublic)
+	}
 	for range 16 {
 		ed, priv, err := ed25519.GenerateKey(rand.Reader)
 		if err != nil {
@@ -45,6 +59,15 @@ func TestNodeKeyConversion(t *testing.T) {
 			t.Fatalf("converted invalid Ed25519 public key %x", invalid)
 		}
 	}
+}
+
+func hexKey(t *testing.T, value string) [32]byte {
+	t.Helper()
+	b, err := hex.DecodeString(value)
+	if err != nil || len(b) != 32 {
+		t.Fatalf("invalid key fixture %q", value)
+	}
+	return [32]byte(b)
 }
 
 // TestNodeV2Mesh exercises the same FD seam used by the C ABI, including the
@@ -260,6 +283,34 @@ func TestNodeV2Mesh(t *testing.T) {
 	}
 	bad.Close()
 	waitForBad(false)
+
+	// Keep both caller-owned FDs open. Closing A's node, not its FD,
+	// must end B's read with EOF over the tunnel.
+	fd, err := nodes[0].dial(ctx, keys[1])
+	a, err := testAdoptStream(t, fd, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd, peer, err := nodes[1].accept(ctx)
+	b, err := testAdoptStream(t, fd, err)
+	if err != nil || peer != keys[0] {
+		t.Fatalf("accept from %v: %v; want peer %v", peer, err, keys[0])
+	}
+	a.SetDeadline(time.Now().Add(5 * time.Second))
+	b.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.WriteString(a, "x"); err != nil {
+		t.Fatal(err)
+	}
+	var one [1]byte
+	if _, err := io.ReadFull(b, one[:]); err != nil || one[0] != 'x' {
+		t.Fatalf("B read %q, %v before close; want x", one, err)
+	}
+	read := make(chan error, 1)
+	go func() { _, err := b.Read(one[:]); read <- err }()
+	nodes[0].Close()
+	if err := <-read; err != io.EOF {
+		t.Fatalf("B's Read after A's node closed = %v; want EOF", err)
+	}
 }
 
 func testAdoptStream(t *testing.T, fd int, err error) (*net.UnixConn, error) {

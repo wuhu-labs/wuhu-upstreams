@@ -136,7 +136,17 @@ func (n *nodeV2) Close() error {
 		n.mu.Lock()
 		n.allow = nil
 		n.mu.Unlock()
+		if n.ln != nil {
+			n.ln.Close()
+		}
 		n.streams.close()
+		if n.ln != nil {
+			// Keep WireGuard and DERP alive while the closed streams' FINs
+			// reach their peers. Bound the drain if a peer is gone.
+			ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+			n.server.DrainTCP(ctx)
+			cancel()
+		}
 		n.server.Close()
 		n.calls.Wait()
 		if n.release != nil {

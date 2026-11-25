@@ -3,8 +3,8 @@
 Static archives of Wuhu's Tailcat bridge, built by `tailcat/build.sh` in github.com/wuhu-labs/wuhu-upstreams against [wuhu-labs/tailcat](https://github.com/wuhu-labs/tailcat) at the revision in `tailcat/pin.env`.
 
 - Upstream base: e99a945255293ae97402680526172e0b4bbd7d1b (v0.7.0 plus 45 commits).
-- Fork commit: 46641759366d29fed9f9af19fa72767a2f25e3ad. It adds `Server.Dial` on the configured DERP region, adds the listener's path-discovery key to the meow reply, and refreshes the handshake before retrying a timed-out stream to a known peer. `Client` is unchanged.
-- Source: `https://github.com/wuhu-labs/tailcat/archive/<commit>.tar.gz`, SHA-256 b6c15466296cc6696180612e044371d1526b4389b05a7b29c3cb4d19b3a0d6a0, republished byte-for-byte as the release's `-source.tar.gz`.
+- Fork commit: a68ed208b6b6f0017b9f14bbc1848248164a2ecc. It adds `Server.Dial` on the configured DERP region, adds the listener's path-discovery key to the meow reply, and refreshes the handshake before retrying a timed-out stream to a known peer. `Client` is unchanged.
+- Source: `https://github.com/wuhu-labs/tailcat/archive/<commit>.tar.gz`, SHA-256 618dadee35be4ec856a7eeaa9fdbdbfeb8597e7da3673bf6297929233cfe8c1c, republished byte-for-byte as the release's `-source.tar.gz`.
 - License: BSD-3-Clause (`LICENSE`, shipped in every artifact).
 - The first-party bridge (`tailcat/wuhu`) is added to the unpacked source as `cmd/wuhutailcat`. It uses public Tailcat and Tailscale APIs. Tailscale is unmodified, and the build tags are Tailcat's `build-tags.txt`.
 - Go: the toolchain `go.mod` names (1.27.4), `CGO_ENABLED=1`, `-trimpath`.
@@ -20,7 +20,7 @@ A `wt_relay` serves DERP on a plaintext stream FD handed over after the HTTP upg
 ## Artifacts
 
 - `tailcat-<version>-apple.zip`: `CTailcat.xcframework` with arm64 slices `macos-arm64` (macOS 14.0 floor), `ios-arm64` and `ios-arm64-simulator` (iOS 17.0 floor, upstream's clang wrappers). Consumers link `-framework CoreFoundation -framework Security -lresolv`.
-- `tailcat-<version>-linux-x86_64.tar.gz` and `tailcat-<version>-linux-arm64.tar.gz`: `include/{wuhu_tailcat.h,module.modulemap}` and `lib/libtailcat.a`, built natively with `-buildmode=c-archive` and `-ldflags "-s -w"` on Ubuntu 22.04 (glibc 2.35 floor), after the bridge's tests pass. The archives need nothing beyond libc.
+- `tailcat-<version>-linux-x86_64.tar.gz` and `tailcat-<version>-linux-arm64.tar.gz`: `include/{wuhu_tailcat.h,module.modulemap}` and `lib/libtailcat.a`, built natively with `-buildmode=c-archive` and `-ldflags "-s -w"` on Ubuntu 22.04 (glibc 2.35 floor), only packaged after the Go tests and linked C ABI smoke test pass. The archives need nothing beyond libc.
 - `tailcat-<version>-source.tar.gz`: the exact fork source above.
 
 Release `tailcat/0.7.0-45-ge99a945` holds the earlier archives of upstream's own `cmd/libtailcat`; it stays as published.
