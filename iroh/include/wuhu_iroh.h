@@ -171,7 +171,8 @@ uint64_t wi_send_write(const wi_send *send, const uint8_t *bytes, size_t len,
  * finishing nothing, while a write is pending (from its call until its callback). */
 wi_status wi_send_finish(const wi_send *send);
 
-/* Abandons the stream with `code` once no write is pending (cancel a pending write first). */
+/* Abandons the stream with `code`: at once when no write is pending, else once it ends (cancel a
+ * pending write first). */
 void wi_send_reset(const wi_send *send, uint64_t code);
 
 /* STOPPED once the peer stops the stream: code. FINISHED once a finished stream's data is all

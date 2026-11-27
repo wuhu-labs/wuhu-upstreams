@@ -155,6 +155,11 @@ pub unsafe extern "C" fn wi_send_finish(send: *const wi_send) -> wi_status {
 pub unsafe extern "C" fn wi_send_reset(send: *const wi_send, code: u64) {
     let state = unsafe { &*send }.0.clone();
     guard((), || {
+        if let Ok(mut send) = state.stream.try_lock() {
+            send.closed = true;
+            let _ = send.stream.reset(var_int(code));
+            return;
+        }
         detach(async move {
             let mut send = state.stream.lock().await;
             send.closed = true;

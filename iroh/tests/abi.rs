@@ -87,6 +87,7 @@ unsafe extern "C" {
         context: *mut c_void,
     ) -> u64;
     fn wi_send_finish(send: *const c_void) -> i32;
+    fn wi_send_reset(send: *const c_void, code: u64);
     fn wi_send_free(send: *mut c_void);
     fn wi_recv_read(recv: *const c_void, max: usize, callback: Callback, context: *mut c_void)
     -> u64;
@@ -460,6 +461,22 @@ fn a_read_of_at_most_zero_bytes_is_an_error_and_takes_nothing() {
         wi_recv_free(recv);
         wi_send_free(peer_send);
         wi_recv_free(peer_recv);
+    }
+}
+
+#[test]
+fn a_finish_right_after_a_reset_finishes_nothing() {
+    let link = Link::new([19, 20]);
+    for _ in 0..20 {
+        let ([send, recv], [peer_send, peer_recv]) = link.stream(b"x");
+        unsafe { wi_send_reset(send, 3) };
+        assert_eq!(unsafe { wi_send_finish(send) }, 4, "CLOSED once reset");
+        unsafe {
+            wi_send_free(send);
+            wi_recv_free(recv);
+            wi_send_free(peer_send);
+            wi_recv_free(peer_recv);
+        }
     }
 }
 
