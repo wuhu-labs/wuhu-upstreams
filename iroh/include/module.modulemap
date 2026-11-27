@@ -1,0 +1,4 @@
+module CIroh {
+    header "wuhu_iroh.h"
+    export *
+}

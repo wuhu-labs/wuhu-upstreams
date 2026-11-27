@@ -1,0 +1,45 @@
+name: iroh
+
+on:
+  push:
+    paths: [iroh/**, .github/workflows/iroh.yml]
+  pull_request:
+    paths: [iroh/**, .github/workflows/iroh.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: apple
+            runs-on: macos-latest
+          - kind: linux
+            runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - name: Rust
+        working-directory: iroh
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            iroh/target
+          key: iroh-${{ matrix.kind }}-${{ hashFiles('iroh/Cargo.lock', 'iroh/rust-toolchain.toml') }}
+      - run: iroh/build.sh ${{ matrix.kind }} dist
+      - name: Checksums
+        working-directory: dist
+        run: shasum -a 256 * | tee SHA256SUMS-${{ matrix.kind }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iroh-${{ matrix.kind }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14

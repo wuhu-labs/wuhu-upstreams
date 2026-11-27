@@ -1,0 +1,16 @@
+# iroh for Wuhu
+
+Static archives of `wuhu_iroh`, Wuhu's C ABI over [iroh](https://github.com/n0-computer/iroh) and its embedded relay (`iroh-relay`, feature `server`), built by `iroh/build.sh` in github.com/wuhu-labs/wuhu-upstreams.
+
+- Upstream: the crates.io releases `iroh` and `iroh-relay` at the exact version `Cargo.toml` names, with every transitive crate at the version and checksum `Cargo.lock` records (shipped in every artifact). Nothing upstream is patched.
+- License: iroh is MIT OR Apache-2.0; the crate here is first-party.
+- Rust: the toolchain `rust-toolchain.toml` names, release profile with LTO and `panic = "unwind"` so no panic crosses the ABI.
+
+## The ABI
+
+`include/wuhu_iroh.h` is the whole contract: endpoints made from an Ed25519 secret key and one relay URL (relay only, or relay plus direct UDP; no discovery service), connections whose accept hands over the verified caller key, bidirectional streams with QUIC backpressure, path and relay state, `network_change`, and an embedded relay with caller admission (`on_connect`, `on_disconnect`) and `disconnect(key)`. Asynchronous calls complete through a callback, exactly once, and can be cancelled.
+
+## Artifacts
+
+- `iroh-<version>-apple.zip`: `CIroh.xcframework` with arm64 slices `macos-arm64` (macOS 14.0 floor), `ios-arm64` and `ios-arm64-simulator` (iOS 17.0 floor). Consumers link `-framework CoreFoundation -framework Security -framework SystemConfiguration`.
+- `iroh-<version>-linux-x86_64.tar.gz`: `include/{wuhu_iroh.h,module.modulemap}` and `lib/libwuhu_iroh.a`, built on Ubuntu 22.04 (glibc 2.35 floor), packaged only after `cargo test` (the ABI end to end on localhost) passes. Consumers link `-lgcc_s -lutil -lrt -lpthread -lm -ldl -lc`.
