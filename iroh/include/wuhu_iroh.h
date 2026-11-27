@@ -62,6 +62,9 @@ typedef void (*wi_callback)(void *context, const wi_result *result);
 
 void wi_cancel(uint64_t operation);
 
+/* The Ed25519 public key of `secret_key`. */
+void wi_secret_key_public(const uint8_t secret_key[32], uint8_t out_public_key[32]);
+
 /* ---- Endpoint ---------------------------------------------------------------------------- */
 
 /* Binds an endpoint for `secret_key` whose only relay is `relay_url`, accepting and dialling the

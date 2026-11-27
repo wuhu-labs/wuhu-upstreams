@@ -94,6 +94,15 @@ pub unsafe extern "C" fn wi_endpoint_bind(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn wi_secret_key_public(secret_key: *const u8, out: *mut u8) {
+    let secret = SecretKey::from_bytes(&unsafe { key(secret_key) });
+    guard((), || {
+        let bytes = *secret.public().as_bytes();
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, 32) };
+    })
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wi_endpoint_key(endpoint: *const wi_endpoint, out: *mut u8) {
     let endpoint = unsafe { &*endpoint };
     guard((), || {
