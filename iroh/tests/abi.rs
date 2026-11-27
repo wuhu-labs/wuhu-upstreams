@@ -3,8 +3,8 @@
 use std::{
     ffi::{CStr, CString, c_char, c_void},
     ptr,
-    sync::mpsc,
-    time::Duration,
+    sync::{Mutex, mpsc},
+    time::{Duration, Instant},
 };
 
 use wuhu_iroh as _;
@@ -89,6 +89,8 @@ unsafe extern "C" {
     fn wi_recv_read(recv: *const c_void, max: usize, callback: Callback, context: *mut c_void)
     -> u64;
     fn wi_recv_free(recv: *mut c_void);
+    fn wi_endpoint_close(endpoint: *const c_void, callback: Callback, context: *mut c_void) -> u64;
+    fn wi_relay_shutdown(relay: *const c_void, callback: Callback, context: *mut c_void) -> u64;
     fn wi_cancel(operation: u64);
 }
 
@@ -145,15 +147,31 @@ unsafe extern "C" fn admit(_: *mut c_void, _key: *const u8, _: u64) -> bool {
     true
 }
 
-#[test]
-fn echo_through_relay_and_kick() {
-    let http = CString::new("127.0.0.1:0").unwrap();
+/// An open relay on localhost and its URL.
+fn spawn_relay() -> (*mut c_void, CString) {
     let access = Access {
         context: ptr::null_mut(),
         on_connect: Some(admit),
         on_disconnect: None,
         release: None,
     };
+    spawn_relay_access(access)
+}
+
+fn spawn_relay_with(
+    on_connect: unsafe extern "C" fn(*mut c_void, *const u8, u64) -> bool,
+    on_disconnect: unsafe extern "C" fn(*mut c_void, *const u8, u64),
+) -> (*mut c_void, CString) {
+    spawn_relay_access(Access {
+        context: ptr::null_mut(),
+        on_connect: Some(on_connect),
+        on_disconnect: Some(on_disconnect),
+        release: None,
+    })
+}
+
+fn spawn_relay_access(access: Access) -> (*mut c_void, CString) {
+    let http = CString::new("127.0.0.1:0").unwrap();
     let relay = ok(call(|cb, cx| unsafe {
         wi_relay_spawn(http.as_ptr(), ptr::null(), ptr::null(), ptr::null(), access, cb, cx)
     }))
@@ -165,16 +183,104 @@ fn echo_through_relay_and_kick() {
         "http://{}",
         unsafe { CStr::from_ptr(address.as_ptr()) }.to_str().unwrap()
     );
-    let url = CString::new(url).unwrap();
-    let alpn = b"wuhu/test/0";
+    (relay, CString::new(url).unwrap())
+}
 
-    let bind = |seed: u8| {
-        let secret = [seed; 32];
-        ok(call(|cb, cx| unsafe {
-            wi_endpoint_bind(secret.as_ptr(), url.as_ptr(), true, alpn.as_ptr(), alpn.len(), cb, cx)
-        }))
-        .handles[0] as *mut c_void
-    };
+fn bind(seed: u8, url: &CString) -> *mut c_void {
+    let secret = [seed; 32];
+    let alpn = b"wuhu/test/0";
+    ok(call(|cb, cx| unsafe {
+        wi_endpoint_bind(secret.as_ptr(), url.as_ptr(), true, alpn.as_ptr(), alpn.len(), cb, cx)
+    }))
+    .handles[0] as *mut c_void
+}
+
+static SHUT_OUT: Mutex<Vec<[u8; 32]>> = Mutex::new(Vec::new());
+static GONE: Mutex<Vec<[u8; 32]>> = Mutex::new(Vec::new());
+
+unsafe extern "C" fn admit_unless_shut_out(_: *mut c_void, key: *const u8, _: u64) -> bool {
+    let key = unsafe { *(key as *const [u8; 32]) };
+    !SHUT_OUT.lock().unwrap().contains(&key)
+}
+
+unsafe extern "C" fn record_gone(_: *mut c_void, key: *const u8, _: u64) {
+    GONE.lock().unwrap().push(unsafe { *(key as *const [u8; 32]) });
+}
+
+/// Polls every 10 ms, for at most `limit`.
+fn eventually(limit: Duration, condition: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    condition()
+}
+
+/// The server drops off the relay for good, so the client's close drains for a while: the
+/// cancel lands mid-close, after iroh marked the endpoint closing and before it stopped.
+#[test]
+fn a_close_cancelled_midway_still_runs_to_its_end() {
+    let (relay, url) = spawn_relay_with(admit_unless_shut_out, record_gone);
+    let server = bind(3, &url);
+    let client = bind(4, &url);
+    let (mut server_key, mut client_key) = ([0u8; 32], [0u8; 32]);
+    unsafe {
+        wi_endpoint_key(server, server_key.as_mut_ptr());
+        wi_endpoint_key(client, client_key.as_mut_ptr());
+    }
+    let accepted = call(|cb, cx| unsafe { wi_endpoint_accept(server, cb, cx) });
+    let outgoing = ok(call(|cb, cx| unsafe {
+        wi_endpoint_connect(client, server_key.as_ptr(), url.as_ptr(), cb, cx)
+    }))
+    .handles[0] as *mut c_void;
+    let incoming = ok(accepted).handles[0] as *mut c_void;
+    let opened = ok(call(|cb, cx| unsafe { wi_connection_open(outgoing, cb, cx) }));
+    let (send, recv) = (opened.handles[0] as *mut c_void, opened.handles[1] as *mut c_void);
+    ok(call(|cb, cx| unsafe { wi_send_write(send, b"hi".as_ptr(), 2, cb, cx) }));
+    let pending = call(|cb, cx| unsafe { wi_recv_read(recv, 65536, cb, cx) });
+
+    SHUT_OUT.lock().unwrap().push(server_key);
+    assert!(unsafe { wi_relay_disconnect(relay, server_key.as_ptr()) });
+    let first = call(|cb, cx| unsafe {
+        let id = wi_endpoint_close(client, cb, cx);
+        std::thread::sleep(Duration::from_millis(20));
+        wi_cancel(id);
+        id
+    });
+    let first = wait(first);
+    assert!(first.status == 5 || first.status == 0, "{first:?}");
+    ok(call(|cb, cx| unsafe { wi_endpoint_close(client, cb, cx) }));
+    assert_eq!(wait(pending).status, 4, "the in-flight read ends with the close");
+    assert!(
+        eventually(Duration::from_secs(2), || GONE.lock().unwrap().contains(&client_key)),
+        "the client's relay connection ended with its close",
+    );
+
+    let first = wait(call(|cb, cx| unsafe {
+        let id = wi_relay_shutdown(relay, cb, cx);
+        wi_cancel(id);
+        id
+    }));
+    assert!(first.status == 5 || first.status == 0, "{first:?}");
+    ok(call(|cb, cx| unsafe { wi_relay_shutdown(relay, cb, cx) }));
+    unsafe {
+        wi_send_free(send);
+        wi_recv_free(recv);
+        wi_connection_free(outgoing);
+        wi_connection_free(incoming);
+        wi_endpoint_free(client);
+        wi_endpoint_free(server);
+        wi_relay_free(relay);
+    }
+}
+
+#[test]
+fn echo_through_relay_and_kick() {
+    let (relay, url) = spawn_relay();
+    let bind = |seed: u8| bind(seed, &url);
     let server = bind(1);
     let client = bind(2);
     let mut server_key = [0u8; 32];

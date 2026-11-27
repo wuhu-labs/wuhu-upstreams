@@ -12,7 +12,10 @@ use std::{
     },
 };
 
-use futures_util::FutureExt;
+use futures_util::{
+    FutureExt,
+    future::{BoxFuture, Shared},
+};
 use tokio::{runtime::Runtime, task::AbortHandle};
 
 #[repr(C)]
@@ -248,4 +251,28 @@ pub unsafe extern "C" fn wi_log_to_stderr(filter: *const c_char) {
             .with_ansi(false)
             .try_init();
     })
+}
+
+/// Work that runs to its end once on the runtime, however many callers wait on it and whether or
+/// not they are cancelled: a cancelled `wi_cancel` drops only its own wait.
+pub struct RunOnce<T: Clone + Send + Sync + 'static>(Mutex<Option<Shared<BoxFuture<'static, T>>>>);
+
+impl<T: Clone + Send + Sync + 'static> RunOnce<T> {
+    pub fn new() -> Self {
+        RunOnce(Mutex::new(None))
+    }
+
+    /// The work's outcome; the first call starts `work`, later calls wait for that same run.
+    pub fn run<F: Future<Output = T> + Send + 'static>(
+        &self,
+        panicked: T,
+        work: impl FnOnce() -> F,
+    ) -> Shared<BoxFuture<'static, T>> {
+        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        slot.get_or_insert_with(|| {
+            let task = runtime().spawn(work());
+            async move { task.await.unwrap_or(panicked) }.boxed().shared()
+        })
+        .clone()
+    }
 }

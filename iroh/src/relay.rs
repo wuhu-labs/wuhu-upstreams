@@ -13,7 +13,7 @@ use iroh_relay::server::{
 };
 use tokio::sync::Mutex;
 
-use crate::op::{Outcome, guard, handle, key, runtime, spawn, text, wi_callback};
+use crate::op::{Outcome, RunOnce, guard, handle, key, runtime, spawn, text, wi_callback};
 
 #[repr(C)]
 #[allow(non_camel_case_types)]
@@ -71,6 +71,7 @@ impl AccessControl for CallerAccess {
 #[allow(non_camel_case_types)]
 pub struct wi_relay {
     server: Arc<Mutex<Option<Server>>>,
+    shutdown: RunOnce<Result<(), String>>,
     service: RelayService,
     metrics: Arc<iroh_relay::server::Metrics>,
     http: Option<SocketAddr>,
@@ -157,6 +158,7 @@ pub unsafe extern "C" fn wi_relay_spawn(
                     https: server.https_addr(),
                     service,
                     server: Arc::new(Mutex::new(Some(server))),
+                    shutdown: RunOnce::new(),
                 }))
             }
             Err(e) => Outcome::error(e),
@@ -215,14 +217,18 @@ pub unsafe extern "C" fn wi_relay_shutdown(
     callback: wi_callback,
     context: *mut c_void,
 ) -> u64 {
-    let server = unsafe { &*relay }.server.clone();
-    spawn(callback, context, async move {
+    let this = unsafe { &*relay };
+    let server = this.server.clone();
+    let shutdown = this.shutdown.run(Err("panic in wuhu_iroh".into()), || async move {
         let Some(server) = server.lock().await.take() else {
-            return Outcome::Ok;
+            return Ok(());
         };
-        match server.shutdown().await {
+        server.shutdown().await.map_err(|e| e.to_string())
+    });
+    spawn(callback, context, async move {
+        match shutdown.await {
             Ok(()) => Outcome::Ok,
-            Err(e) => Outcome::error(e),
+            Err(e) => Outcome::Error(e),
         }
     })
 }

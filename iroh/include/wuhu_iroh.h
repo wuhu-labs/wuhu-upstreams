@@ -110,7 +110,8 @@ bool wi_endpoint_relay_state(const wi_endpoint *endpoint, wi_relay_state *out);
 uint64_t wi_endpoint_relay_changed(const wi_endpoint *endpoint, wi_callback callback,
                                    void *context);
 
-/* Closes every connection and the endpoint. OK when done. */
+/* Closes every connection and the endpoint. OK when done. The close runs to its end even when this
+ * call is cancelled; a later call waits for the same close. */
 uint64_t wi_endpoint_close(const wi_endpoint *endpoint, wi_callback callback, void *context);
 
 void wi_endpoint_free(wi_endpoint *endpoint);
@@ -214,7 +215,8 @@ void wi_relay_traffic(const wi_relay *relay, uint64_t *out_sent, uint64_t *out_r
 /* Disconnects every connection of `public_key`; false when it had none. */
 bool wi_relay_disconnect(const wi_relay *relay, const uint8_t public_key[32]);
 
-/* Stops serving and disconnects every client. OK when done. */
+/* Stops serving and disconnects every client. OK when done. The shutdown runs to its end even when
+ * this call is cancelled; a later call waits for the same shutdown. */
 uint64_t wi_relay_shutdown(const wi_relay *relay, wi_callback callback, void *context);
 
 /* Drops the handle; a relay not shut down is shut down in the background. */

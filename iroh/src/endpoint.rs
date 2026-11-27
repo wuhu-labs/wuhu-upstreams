@@ -10,7 +10,7 @@ use iroh::{
 use futures_util::{StreamExt, stream::BoxStream};
 use tokio::sync::Mutex;
 
-use crate::op::{Outcome, fill, guard, handle, key, spawn, text, wi_callback};
+use crate::op::{Outcome, RunOnce, fill, guard, handle, key, spawn, text, wi_callback};
 use crate::stream::{RecvHandle, SendHandle};
 
 #[allow(non_camel_case_types)]
@@ -18,6 +18,7 @@ pub struct wi_endpoint {
     endpoint: Endpoint,
     alpn: Vec<u8>,
     relay_changes: Arc<Mutex<BoxStream<'static, Vec<RelayStatus>>>>,
+    close: RunOnce<()>,
 }
 
 #[allow(non_camel_case_types)]
@@ -86,6 +87,7 @@ pub unsafe extern "C" fn wi_endpoint_bind(
                     endpoint,
                     alpn,
                     relay_changes: Arc::new(Mutex::new(changes)),
+                    close: RunOnce::new(),
                 }))
             }
             Err(e) => Outcome::error(e),
@@ -246,9 +248,11 @@ pub unsafe extern "C" fn wi_endpoint_close(
     callback: wi_callback,
     context: *mut c_void,
 ) -> u64 {
-    let endpoint = unsafe { &*endpoint }.endpoint.clone();
+    let this = unsafe { &*endpoint };
+    let endpoint = this.endpoint.clone();
+    let closing = this.close.run((), || async move { endpoint.close().await });
     spawn(callback, context, async move {
-        endpoint.close().await;
+        closing.await;
         Outcome::Ok
     })
 }
