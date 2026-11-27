@@ -75,24 +75,26 @@ struct Reply {
     callback: wi_callback,
     context: usize,
     done: bool,
+    /// Released just before the callback runs.
+    held: Option<Box<dyn Send>>,
 }
 
 impl Reply {
     fn send(mut self, outcome: Outcome) {
         self.done = true;
-        deliver(self.callback, self.context, outcome);
+        deliver(self.callback, self.context, outcome, self.held.take());
     }
 }
 
 impl Drop for Reply {
     fn drop(&mut self) {
         if !self.done {
-            deliver(self.callback, self.context, Outcome::Cancelled);
+            deliver(self.callback, self.context, Outcome::Cancelled, self.held.take());
         }
     }
 }
 
-fn deliver(callback: wi_callback, context: usize, outcome: Outcome) {
+fn deliver(callback: wi_callback, context: usize, outcome: Outcome, held: Option<Box<dyn Send>>) {
     let Some(callback) = callback else { return };
     let mut result = wi_result {
         status: wi_status::WI_OK,
@@ -145,6 +147,7 @@ fn deliver(callback: wi_callback, context: usize, outcome: Outcome) {
     if let Some(m) = &message {
         result.message = m.as_ptr();
     }
+    drop(held);
     unsafe { callback(context as *mut c_void, &result) };
 }
 
@@ -187,11 +190,22 @@ pub fn spawn(
     context: *mut c_void,
     work: impl Future<Output = Outcome> + Send + 'static,
 ) -> u64 {
+    spawn_holding((), callback, context, work)
+}
+
+/// `spawn`, keeping `held` until just before the callback runs, whatever ends the operation.
+pub fn spawn_holding(
+    held: impl Send + 'static,
+    callback: wi_callback,
+    context: *mut c_void,
+    work: impl Future<Output = Outcome> + Send + 'static,
+) -> u64 {
     let id = NEXT_OPERATION.fetch_add(1, Ordering::Relaxed);
     let reply = Reply {
         callback,
         context: context as usize,
         done: false,
+        held: Some(Box::new(held)),
     };
     let runtime = match runtime() {
         Ok(runtime) => runtime,

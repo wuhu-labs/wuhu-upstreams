@@ -3,13 +3,13 @@
 use std::{
     ffi::{c_char, c_void},
     ptr,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, Weak},
 };
 
 use iroh::{
     Endpoint, EndpointAddr, PublicKey, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
     Watcher,
-    endpoint::{Connection, ConnectionError, presets},
+    endpoint::{Connection, ConnectionError, VarInt, presets},
 };
 use futures_util::StreamExt;
 
@@ -23,23 +23,52 @@ pub struct wi_endpoint {
     relay: RelayUrl,
     alpn: Vec<u8>,
     close: RunOnce<()>,
+    connections: Arc<Mutex<Connections>>,
+}
+
+/// The endpoint's connections, so that its close goes through each one's `Closer`.
+#[derive(Default)]
+struct Connections {
+    closed: bool,
+    live: Vec<Weak<Closer>>,
+}
+
+impl Connections {
+    fn adopt(connections: &Mutex<Connections>, connection: Connection) -> wi_connection {
+        let closer = Arc::new(Closer {
+            connection,
+            won: Mutex::new(None),
+        });
+        let mut connections = connections.lock().unwrap_or_else(|e| e.into_inner());
+        if connections.closed {
+            closer.close(VarInt::from_u32(0));
+        } else {
+            connections.live.retain(|c| c.strong_count() > 0);
+            connections.live.push(Arc::downgrade(&closer));
+        }
+        wi_connection(closer)
+    }
+}
+
+/// iroh reports every local close only as "locally closed". Ours and the endpoint's all go through
+/// `won`, which keeps the code of the one that reached noq first: the one the peer saw.
+struct Closer {
+    connection: Connection,
+    won: Mutex<Option<u64>>,
+}
+
+impl Closer {
+    fn close(&self, code: VarInt) {
+        let mut won = self.won.lock().unwrap_or_else(|e| e.into_inner());
+        if won.is_none() && self.connection.close_reason().is_none() {
+            *won = Some(code.into_inner());
+        }
+        self.connection.close(code, b"");
+    }
 }
 
 #[allow(non_camel_case_types)]
-pub struct wi_connection {
-    connection: Connection,
-    /// The code of our own `wi_connection_close`, which iroh reports only as "locally closed".
-    local_close: Arc<OnceLock<u64>>,
-}
-
-impl wi_connection {
-    fn new(connection: Connection) -> Self {
-        wi_connection {
-            connection,
-            local_close: Arc::new(OnceLock::new()),
-        }
-    }
-}
+pub struct wi_connection(Arc<Closer>);
 
 fn relay_url(text: Option<String>) -> Result<RelayUrl, String> {
     let text = text.ok_or("no relay URL")?;
@@ -94,6 +123,7 @@ pub unsafe extern "C" fn wi_endpoint_bind(
                 relay,
                 alpn,
                 close: RunOnce::new(),
+                connections: Default::default(),
             })),
             Err(e) => Outcome::error(e),
         }
@@ -129,6 +159,7 @@ pub unsafe extern "C" fn wi_endpoint_connect(
     let endpoint = this.endpoint.clone();
     let alpn = this.alpn.clone();
     let relay = this.relay.clone();
+    let connections = this.connections.clone();
     let peer = PublicKey::from_bytes(&unsafe { key(public_key) });
     spawn(callback, context, async move {
         let peer = match peer {
@@ -139,7 +170,7 @@ pub unsafe extern "C" fn wi_endpoint_connect(
         match endpoint.connect(address, &alpn).await {
             Ok(connection) => {
                 let remote = *connection.remote_id().as_bytes();
-                Outcome::Keyed(handle(wi_connection::new(connection)), remote)
+                Outcome::Keyed(handle(Connections::adopt(&connections, connection)), remote)
             }
             Err(e) if endpoint.is_closed() => Outcome::Closed(format!("{e:#}")),
             Err(e) => Outcome::error(e),
@@ -153,7 +184,9 @@ pub unsafe extern "C" fn wi_endpoint_accept(
     callback: wi_callback,
     context: *mut c_void,
 ) -> u64 {
-    let endpoint = unsafe { &*endpoint }.endpoint.clone();
+    let this = unsafe { &*endpoint };
+    let endpoint = this.endpoint.clone();
+    let connections = this.connections.clone();
     spawn(callback, context, async move {
         loop {
             let Some(incoming) = endpoint.accept().await else {
@@ -169,7 +202,10 @@ pub unsafe extern "C" fn wi_endpoint_accept(
             match accepting.await {
                 Ok(connection) => {
                     let remote = *connection.remote_id().as_bytes();
-                    return Outcome::Keyed(handle(wi_connection::new(connection)), remote);
+                    return Outcome::Keyed(
+                        handle(Connections::adopt(&connections, connection)),
+                        remote,
+                    );
                 }
                 Err(e) => tracing::debug!("handshake failed: {e:#}"),
             }
@@ -244,7 +280,18 @@ pub unsafe extern "C" fn wi_endpoint_close(
 ) -> u64 {
     let this = unsafe { &*endpoint };
     let endpoint = this.endpoint.clone();
-    let closing = this.close.run((), || async move { endpoint.close().await });
+    let connections = this.connections.clone();
+    let closing = this.close.run((), || async move {
+        let live = {
+            let mut connections = connections.lock().unwrap_or_else(|e| e.into_inner());
+            connections.closed = true;
+            std::mem::take(&mut connections.live)
+        };
+        for closer in live.iter().filter_map(Weak::upgrade) {
+            closer.close(VarInt::from_u32(0));
+        }
+        endpoint.close().await
+    });
     spawn(callback, context, async move {
         closing.await;
         Outcome::Ok
@@ -260,7 +307,7 @@ pub unsafe extern "C" fn wi_endpoint_free(endpoint: *mut wi_endpoint) {
 pub unsafe extern "C" fn wi_connection_peer(connection: *const wi_connection, out: *mut u8) {
     let connection = unsafe { &*connection };
     guard((), || {
-        let bytes = *connection.connection.remote_id().as_bytes();
+        let bytes = *connection.0.connection.remote_id().as_bytes();
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, 32) };
     })
 }
@@ -271,7 +318,7 @@ pub unsafe extern "C" fn wi_connection_open(
     callback: wi_callback,
     context: *mut c_void,
 ) -> u64 {
-    let connection = unsafe { &*connection }.connection.clone();
+    let connection = unsafe { &*connection }.0.connection.clone();
     spawn(callback, context, async move {
         match connection.open_bi().await {
             Ok((send, recv)) => {
@@ -288,7 +335,7 @@ pub unsafe extern "C" fn wi_connection_accept(
     callback: wi_callback,
     context: *mut c_void,
 ) -> u64 {
-    let connection = unsafe { &*connection }.connection.clone();
+    let connection = unsafe { &*connection }.0.connection.clone();
     spawn(callback, context, async move {
         match connection.accept_bi().await {
             Ok((send, recv)) => {
@@ -315,7 +362,7 @@ pub unsafe extern "C" fn wi_connection_path(
     let connection = unsafe { &*connection };
     let out = unsafe { &mut *out };
     guard(false, || {
-        let paths = connection.connection.paths();
+        let paths = connection.0.connection.paths();
         let Some(path) = paths
             .iter()
             .find(|p| p.is_selected())
@@ -337,7 +384,7 @@ pub unsafe extern "C" fn wi_connection_path(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wi_connection_path_watch(connection: *const wi_connection) -> *mut wi_watch {
-    let connection = &unsafe { &*connection }.connection;
+    let connection = &unsafe { &*connection }.0.connection;
     guard(ptr::null_mut(), || {
         let closing = connection.weak_handle();
         let changes = connection
@@ -355,14 +402,13 @@ pub unsafe extern "C" fn wi_connection_closed(
     callback: wi_callback,
     context: *mut c_void,
 ) -> u64 {
-    let this = unsafe { &*connection };
-    let connection = this.connection.clone();
-    let local_close = this.local_close.clone();
+    let closer = unsafe { &*connection }.0.clone();
     spawn(callback, context, async move {
-        let error = connection.closed().await;
-        let (code, reason) = match (&error, local_close.get()) {
-            (ConnectionError::LocallyClosed, Some(code)) => (*code, String::new()),
-            _ => closed_reason(&error),
+        let error = closer.connection.closed().await;
+        let won = *closer.won.lock().unwrap_or_else(|e| e.into_inner());
+        let (code, reason) = match error {
+            ConnectionError::LocallyClosed => (won.unwrap_or(0), String::new()),
+            other => closed_reason(&other),
         };
         Outcome::ClosedWith(code, reason)
     })
@@ -370,12 +416,8 @@ pub unsafe extern "C" fn wi_connection_closed(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wi_connection_close(connection: *const wi_connection, code: u64) {
-    let connection = unsafe { &*connection };
-    guard((), || {
-        let code = iroh::endpoint::VarInt::from_u64(code).unwrap_or(iroh::endpoint::VarInt::MAX);
-        let _ = connection.local_close.set(code.into_inner());
-        connection.connection.close(code, b"");
-    })
+    let closer = &unsafe { &*connection }.0;
+    guard((), || closer.close(VarInt::from_u64(code).unwrap_or(VarInt::MAX)))
 }
 
 #[unsafe(no_mangle)]

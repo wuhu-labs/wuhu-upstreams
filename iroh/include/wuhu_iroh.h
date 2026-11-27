@@ -148,9 +148,10 @@ bool wi_connection_path(const wi_connection *connection, wi_path *out);
  * for wi_watch_next; NULL on failure. Every cursor sees every event. */
 wi_watch *wi_connection_path_watch(const wi_connection *connection);
 
-/* CLOSED when the connection closes: code is the peer's application close code, or ours as given
- * to wi_connection_close, 0 for any other cause; message the peer's reason or the cause (empty
- * for our own close). */
+/* CLOSED when the connection closes: code is the peer's application close code, or the code of
+ * the local close that took effect (the one the peer saw: the first wi_connection_close, or 0 when
+ * wi_endpoint_close or anything else closed it first), 0 for any other cause; message the peer's
+ * reason or the cause (empty for a local close). */
 uint64_t wi_connection_closed(const wi_connection *connection, wi_callback callback,
                               void *context);
 
@@ -163,20 +164,24 @@ void wi_connection_free(wi_connection *connection);
 /* ---- Streams ----------------------------------------------------------------------------- */
 
 /* Writes all `len` bytes (copied before return). OK once QUIC flow control has taken them all.
- * STOPPED: code. CLOSED or ERROR: message. One pending write per stream. */
+ * STOPPED: code. RESET when wi_send_reset abandoned the stream first: its code. CLOSED or ERROR:
+ * message. One pending write per stream. */
 uint64_t wi_send_write(const wi_send *send, const uint8_t *bytes, size_t len,
                        wi_callback callback, void *context);
 
 /* Ends the stream after what was written. OK; CLOSED when it is already finished or reset; ERROR,
- * finishing nothing, while a write is pending (from its call until its callback). */
+ * finishing nothing, while a write is pending: from its call until its outcome is decided and its
+ * bytes are in QUIC's buffer, which is handed to its callback just after. */
 wi_status wi_send_finish(const wi_send *send);
 
-/* Abandons the stream with `code`: at once when no write is pending, else once it ends (cancel a
- * pending write first). */
+/* Abandons the stream with `code`, at once; a pending write ends with RESET. */
 void wi_send_reset(const wi_send *send, uint64_t code);
 
 /* STOPPED once the peer stops the stream: code. FINISHED once a finished stream's data is all
- * acknowledged. CLOSED when the connection is lost first: message. Any number may be pending. */
+ * acknowledged. RESET, at once, when wi_send_reset abandoned the stream, before or while it waits:
+ * its code. CLOSED when the connection is lost first: message. Any number may be pending; nothing
+ * is registered with QUIC until one is. noq 1.5 keeps a stream's watcher until the stream finishes,
+ * is stopped or the connection ends, so a stream waited on and then reset holds one until close. */
 uint64_t wi_send_stopped(const wi_send *send, wi_callback callback, void *context);
 
 /* Drops the handle; a stream neither finished nor reset is reset with code 0. */

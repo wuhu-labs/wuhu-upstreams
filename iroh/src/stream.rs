@@ -2,20 +2,19 @@
 
 use std::{
     ffi::c_void,
+    future::poll_fn,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    task::Poll,
 };
 
-use futures_util::{
-    FutureExt,
-    future::{BoxFuture, Shared},
-};
 use iroh::endpoint::{ReadError, RecvStream, SendStream, StoppedError, VarInt, WriteError};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
-use crate::op::{Outcome, detach, guard, spawn, wi_callback, wi_status};
+use crate::op::{Outcome, detach, guard, spawn, spawn_holding, wi_callback, wi_status};
 
 struct Send {
     stream: SendStream,
@@ -30,48 +29,48 @@ impl Drop for Send {
     }
 }
 
-#[derive(Clone)]
-enum Stop {
-    Stopped(u64),
-    Ended,
-    Lost(String),
+/// The send half. `stream` is only ever locked for a synchronous step, never across an await, so
+/// a reset, a finish or a stop watcher reaches it while a write waits on flow control.
+struct SendState {
+    stream: std::sync::Mutex<Send>,
+    writer: Mutex<()>,
+    /// Writes from their call to the return of their callback.
+    writes: AtomicUsize,
+    /// Our own reset's code, set once noq took it. noq wakes no stop watcher for a local reset
+    /// and, once the reset is acknowledged, reports the stream like an acknowledged finish.
+    reset: watch::Sender<Option<u64>>,
 }
 
-struct SendState {
-    stream: Mutex<Send>,
-    /// Writes submitted and not yet replied to, counted before they are spawned, so a finish
-    /// between a write's call and its first poll still sees it.
-    writes: AtomicUsize,
-    stopped: Shared<BoxFuture<'static, Stop>>,
+impl SendState {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Send> {
+        self.stream.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 pub struct SendHandle(Arc<SendState>);
 
 impl SendHandle {
     pub fn new(stream: SendStream) -> Self {
-        let stopped = stream.stopped();
-        let stopped = async move {
-            match stopped.await {
-                Ok(Some(code)) => Stop::Stopped(code.into_inner()),
-                Ok(None) => Stop::Ended,
-                Err(StoppedError::ConnectionLost(e)) => Stop::Lost(e.to_string()),
-                Err(e) => Stop::Lost(e.to_string()),
-            }
-        }
-        .boxed()
-        .shared();
         SendHandle(Arc::new(SendState {
-            stream: Mutex::new(Send {
+            stream: std::sync::Mutex::new(Send {
                 stream,
                 closed: false,
             }),
+            writer: Mutex::new(()),
             writes: AtomicUsize::new(0),
-            stopped,
+            reset: watch::Sender::new(None),
         }))
     }
 }
 
 struct PendingWrite(Arc<SendState>);
+
+impl PendingWrite {
+    fn new(state: &Arc<SendState>) -> Self {
+        state.writes.fetch_add(1, Ordering::SeqCst);
+        PendingWrite(state.clone())
+    }
+}
 
 impl Drop for PendingWrite {
     fn drop(&mut self) {
@@ -113,19 +112,39 @@ pub unsafe extern "C" fn wi_send_write(
     context: *mut c_void,
 ) -> u64 {
     let state = unsafe { &*send }.0.clone();
+    let pending = PendingWrite::new(&state);
     let bytes = if len == 0 {
         Vec::new()
     } else {
         unsafe { std::slice::from_raw_parts(bytes, len) }.to_vec()
     };
-    state.writes.fetch_add(1, Ordering::SeqCst);
-    let pending = PendingWrite(state.clone());
-    spawn(callback, context, async move {
-        let _pending = pending;
-        let mut send = state.stream.lock().await;
-        match send.stream.write_chunk(bytes.into()).await {
-            Ok(()) => Outcome::Ok,
-            Err(e) => write_outcome(e),
+    spawn_holding(pending, callback, context, async move {
+        let _writer = state.writer.lock().await;
+        let mut resets = state.reset.subscribe();
+        let mut written = 0;
+        let write = poll_fn(|cx| {
+            while written < bytes.len() {
+                let mut send = state.lock();
+                match Pin::new(&mut send.stream).poll_write(cx, &bytes[written..]) {
+                    Poll::Ready(Ok(count)) => written += count,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            Poll::Ready(Ok(()))
+        });
+        let written = tokio::select! {
+            biased;
+            _ = resets.wait_for(Option::is_some) => None,
+            written = write => Some(written),
+        };
+        // A write that our reset woke sees only a closed stream.
+        let reset = *state.reset.borrow();
+        match (written, reset) {
+            (Some(Ok(())), _) => Outcome::Ok,
+            (_, Some(code)) => Outcome::Reset(code),
+            (Some(Err(e)), None) => write_outcome(e),
+            (None, None) => unreachable!("only a reset ends the wait"),
         }
     })
 }
@@ -134,12 +153,10 @@ pub unsafe extern "C" fn wi_send_write(
 pub unsafe extern "C" fn wi_send_finish(send: *const wi_send) -> wi_status {
     let state = &unsafe { &*send }.0;
     guard(wi_status::WI_ERROR, || {
+        let mut send = state.lock();
         if state.writes.load(Ordering::SeqCst) > 0 {
             return wi_status::WI_ERROR;
         }
-        let Ok(mut send) = state.stream.try_lock() else {
-            return wi_status::WI_CLOSED;
-        };
         if send.closed {
             return wi_status::WI_CLOSED;
         }
@@ -153,18 +170,13 @@ pub unsafe extern "C" fn wi_send_finish(send: *const wi_send) -> wi_status {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wi_send_reset(send: *const wi_send, code: u64) {
-    let state = unsafe { &*send }.0.clone();
+    let state = &unsafe { &*send }.0;
     guard((), || {
-        if let Ok(mut send) = state.stream.try_lock() {
-            send.closed = true;
-            let _ = send.stream.reset(var_int(code));
-            return;
+        let mut send = state.lock();
+        send.closed = true;
+        if send.stream.reset(var_int(code)).is_ok() {
+            state.reset.send_replace(Some(code));
         }
-        detach(async move {
-            let mut send = state.stream.lock().await;
-            send.closed = true;
-            let _ = send.stream.reset(var_int(code));
-        });
     })
 }
 
@@ -174,12 +186,27 @@ pub unsafe extern "C" fn wi_send_stopped(
     callback: wi_callback,
     context: *mut c_void,
 ) -> u64 {
-    let stopped = unsafe { &*send }.0.stopped.clone();
+    let state = unsafe { &*send }.0.clone();
     spawn(callback, context, async move {
-        match stopped.await {
-            Stop::Stopped(code) => Outcome::Stopped(code),
-            Stop::Ended => Outcome::Finished,
-            Stop::Lost(reason) => Outcome::Closed(reason),
+        let mut reset = state.reset.subscribe();
+        let stopped = {
+            let send = state.lock();
+            if let Some(code) = *reset.borrow_and_update() {
+                return Outcome::Reset(code);
+            }
+            // noq keeps this watcher's entry until the stream finishes, is stopped or the
+            // connection ends: a stream waited on and then reset locally holds it until then.
+            send.stream.stopped()
+        };
+        tokio::select! {
+            biased;
+            code = reset.wait_for(Option::is_some) => Outcome::Reset(code.map_or(0, |c| c.unwrap_or(0))),
+            stop = stopped => match stop {
+                Ok(Some(code)) => Outcome::Stopped(code.into_inner()),
+                Ok(None) => Outcome::Finished,
+                Err(StoppedError::ConnectionLost(e)) => Outcome::Closed(e.to_string()),
+                Err(e) => Outcome::Closed(e.to_string()),
+            },
         }
     })
 }
