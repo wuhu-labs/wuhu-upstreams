@@ -118,8 +118,12 @@ pub unsafe extern "C" fn wi_recv_read(
     let recv = unsafe { &*recv }.0.clone();
     spawn(callback, context, async move {
         let mut recv = recv.lock().await;
-        match recv.read_chunk(max.max(1)).await {
-            Ok(Some(chunk)) => Outcome::Bytes(chunk.to_vec()),
+        let mut bytes = vec![0; max.max(1)];
+        match recv.read(&mut bytes).await {
+            Ok(Some(count)) => {
+                bytes.truncate(count);
+                Outcome::Bytes(bytes)
+            }
             Ok(None) => Outcome::Finished,
             Err(ReadError::Reset(code)) => Outcome::Reset(code.into_inner()),
             Err(ReadError::ConnectionLost(e)) => Outcome::Closed(e.to_string()),
