@@ -72,6 +72,7 @@ impl AccessControl for CallerAccess {
 pub struct wi_relay {
     server: Arc<Mutex<Option<Server>>>,
     service: RelayService,
+    metrics: Arc<iroh_relay::server::Metrics>,
     http: Option<SocketAddr>,
     https: Option<SocketAddr>,
 }
@@ -151,6 +152,7 @@ pub unsafe extern "C" fn wi_relay_spawn(
                     .expect("a relay server has a relay service")
                     .clone();
                 Outcome::Handle(handle(wi_relay {
+                    metrics: server.metrics().server.clone(),
                     http: server.http_addr(),
                     https: server.https_addr(),
                     service,
@@ -183,6 +185,15 @@ pub unsafe extern "C" fn wi_relay_address(
             *out.add(text.len()) = 0;
         }
         text.len()
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wi_relay_traffic(relay: *const wi_relay, sent: *mut u64, received: *mut u64) {
+    let relay = unsafe { &*relay };
+    guard((), || unsafe {
+        *sent = relay.metrics.bytes_sent.get();
+        *received = relay.metrics.bytes_recv.get();
     })
 }
 

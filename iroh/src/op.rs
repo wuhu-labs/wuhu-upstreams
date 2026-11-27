@@ -237,3 +237,15 @@ pub unsafe fn text(pointer: *const c_char) -> Option<String> {
             .into_owned(),
     )
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wi_log_to_stderr(filter: *const c_char) {
+    let filter = unsafe { text(filter) }.unwrap_or_else(|| "warn".into());
+    guard((), || {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .try_init();
+    })
+}

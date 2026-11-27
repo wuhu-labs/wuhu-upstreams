@@ -4105,6 +4105,7 @@ dependencies = [
  "rustls",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -62,6 +62,10 @@ typedef void (*wi_callback)(void *context, const wi_result *result);
 
 void wi_cancel(uint64_t operation);
 
+/* Logs the library's events at or above `filter` (an env-filter directive such as "warn" or
+ * "iroh=debug,info") to standard error; only the first call takes effect. */
+void wi_log_to_stderr(const char *filter);
+
 /* The Ed25519 public key of `secret_key`. */
 void wi_secret_key_public(const uint8_t secret_key[32], uint8_t out_public_key[32]);
 
@@ -203,6 +207,9 @@ uint64_t wi_relay_spawn(const char *http_address, const char *tls_address,
 /* The bound address ("ip:port") of the HTTP (tls false) or HTTPS listener into `out`; returns its
  * length, 0 when that listener does not exist or `capacity` is too small. */
 size_t wi_relay_address(const wi_relay *relay, bool tls, char *out, size_t capacity);
+
+/* Bytes the relay has sent to and received from its clients since it started. */
+void wi_relay_traffic(const wi_relay *relay, uint64_t *out_sent, uint64_t *out_received);
 
 /* Disconnects every connection of `public_key`; false when it had none. */
 bool wi_relay_disconnect(const wi_relay *relay, const uint8_t public_key[32]);
