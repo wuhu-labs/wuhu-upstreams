@@ -4,3 +4,4 @@ mod endpoint;
 mod op;
 mod relay;
 mod stream;
+mod watch;

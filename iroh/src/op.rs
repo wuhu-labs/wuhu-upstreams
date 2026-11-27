@@ -155,18 +155,33 @@ fn operations() -> &'static Mutex<HashMap<u64, AbortHandle>> {
     OPERATIONS.get_or_init(Default::default)
 }
 
-pub fn runtime() -> &'static Runtime {
+/// The process's runtime, started on first use; an error when the host cannot start it (no
+/// threads, say), in which case the next call tries again.
+pub fn runtime() -> Result<&'static Runtime, String> {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| {
+    static STARTING: Mutex<()> = Mutex::new(());
+    if let Some(runtime) = RUNTIME.get() {
+        return Ok(runtime);
+    }
+    let _starting = STARTING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(runtime) = RUNTIME.get() {
+        return Ok(runtime);
+    }
+    let built = catch_unwind(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_name("wuhu-iroh")
             .build()
-            .expect("tokio runtime")
-    })
+    });
+    match built {
+        Ok(Ok(runtime)) => Ok(RUNTIME.get_or_init(|| runtime)),
+        Ok(Err(e)) => Err(format!("runtime: {e}")),
+        Err(_) => Err("runtime: panicked while starting".into()),
+    }
 }
 
-/// Runs `work` on the runtime and reports its outcome exactly once.
+/// Runs `work` on the runtime and reports its outcome exactly once: ERROR, on the calling thread,
+/// when there is no runtime.
 pub fn spawn(
     callback: wi_callback,
     context: *mut c_void,
@@ -178,8 +193,16 @@ pub fn spawn(
         context: context as usize,
         done: false,
     };
+    let runtime = match runtime() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            drop(work);
+            reply.send(Outcome::Error(e));
+            return id;
+        }
+    };
     let mut registry = operations().lock().unwrap_or_else(|e| e.into_inner());
-    let task = runtime().spawn(async move {
+    let task = runtime.spawn(async move {
         let outcome = AssertUnwindSafe(work)
             .catch_unwind()
             .await
@@ -192,6 +215,13 @@ pub fn spawn(
     });
     registry.insert(id, task.abort_handle());
     id
+}
+
+/// Runs `work` on the runtime without a reply, if there is a runtime.
+pub fn detach(work: impl Future<Output = ()> + Send + 'static) {
+    if let Ok(runtime) = runtime() {
+        runtime.spawn(work);
+    }
 }
 
 /// Runs a synchronous entry point, turning a panic into `fallback`.
@@ -263,15 +293,19 @@ impl<T: Clone + Send + Sync + 'static> RunOnce<T> {
     }
 
     /// The work's outcome; the first call starts `work`, later calls wait for that same run.
+    /// `failed` stands for a run that panicked or could not start.
     pub fn run<F: Future<Output = T> + Send + 'static>(
         &self,
-        panicked: T,
+        failed: T,
         work: impl FnOnce() -> F,
     ) -> Shared<BoxFuture<'static, T>> {
         let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        slot.get_or_insert_with(|| {
-            let task = runtime().spawn(work());
-            async move { task.await.unwrap_or(panicked) }.boxed().shared()
+        slot.get_or_insert_with(|| match runtime() {
+            Ok(runtime) => {
+                let task = runtime.spawn(work());
+                async move { task.await.unwrap_or(failed) }.boxed().shared()
+            }
+            Err(_) => async move { failed }.boxed().shared(),
         })
         .clone()
     }

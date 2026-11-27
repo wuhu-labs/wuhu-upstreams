@@ -1,11 +1,21 @@
 //! The two halves of a bidirectional QUIC stream.
 
-use std::{ffi::c_void, sync::Arc};
+use std::{
+    ffi::c_void,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
-use iroh::endpoint::{ReadError, RecvStream, SendStream, VarInt, WriteError};
+use futures_util::{
+    FutureExt,
+    future::{BoxFuture, Shared},
+};
+use iroh::endpoint::{ReadError, RecvStream, SendStream, StoppedError, VarInt, WriteError};
 use tokio::sync::Mutex;
 
-use crate::op::{Outcome, guard, runtime, spawn, wi_callback};
+use crate::op::{Outcome, detach, guard, spawn, wi_callback, wi_status};
 
 struct Send {
     stream: SendStream,
@@ -20,14 +30,52 @@ impl Drop for Send {
     }
 }
 
-pub struct SendHandle(Arc<Mutex<Send>>);
+#[derive(Clone)]
+enum Stop {
+    Stopped(u64),
+    Ended,
+    Lost(String),
+}
+
+struct SendState {
+    stream: Mutex<Send>,
+    /// Writes submitted and not yet replied to, counted before they are spawned, so a finish
+    /// between a write's call and its first poll still sees it.
+    writes: AtomicUsize,
+    stopped: Shared<BoxFuture<'static, Stop>>,
+}
+
+pub struct SendHandle(Arc<SendState>);
 
 impl SendHandle {
     pub fn new(stream: SendStream) -> Self {
-        SendHandle(Arc::new(Mutex::new(Send {
-            stream,
-            closed: false,
-        })))
+        let stopped = stream.stopped();
+        let stopped = async move {
+            match stopped.await {
+                Ok(Some(code)) => Stop::Stopped(code.into_inner()),
+                Ok(None) => Stop::Ended,
+                Err(StoppedError::ConnectionLost(e)) => Stop::Lost(e.to_string()),
+                Err(e) => Stop::Lost(e.to_string()),
+            }
+        }
+        .boxed()
+        .shared();
+        SendHandle(Arc::new(SendState {
+            stream: Mutex::new(Send {
+                stream,
+                closed: false,
+            }),
+            writes: AtomicUsize::new(0),
+            stopped,
+        }))
+    }
+}
+
+struct PendingWrite(Arc<SendState>);
+
+impl Drop for PendingWrite {
+    fn drop(&mut self) {
+        self.0.writes.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -64,14 +112,17 @@ pub unsafe extern "C" fn wi_send_write(
     callback: wi_callback,
     context: *mut c_void,
 ) -> u64 {
-    let send = unsafe { &*send }.0.clone();
+    let state = unsafe { &*send }.0.clone();
     let bytes = if len == 0 {
         Vec::new()
     } else {
         unsafe { std::slice::from_raw_parts(bytes, len) }.to_vec()
     };
+    state.writes.fetch_add(1, Ordering::SeqCst);
+    let pending = PendingWrite(state.clone());
     spawn(callback, context, async move {
-        let mut send = send.lock().await;
+        let _pending = pending;
+        let mut send = state.stream.lock().await;
         match send.stream.write_chunk(bytes.into()).await {
             Ok(()) => Outcome::Ok,
             Err(e) => write_outcome(e),
@@ -80,26 +131,51 @@ pub unsafe extern "C" fn wi_send_write(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wi_send_finish(send: *const wi_send) -> bool {
-    let send = unsafe { &*send };
-    guard(false, || {
-        let Ok(mut send) = send.0.try_lock() else {
-            return false;
+pub unsafe extern "C" fn wi_send_finish(send: *const wi_send) -> wi_status {
+    let state = &unsafe { &*send }.0;
+    guard(wi_status::WI_ERROR, || {
+        if state.writes.load(Ordering::SeqCst) > 0 {
+            return wi_status::WI_ERROR;
+        }
+        let Ok(mut send) = state.stream.try_lock() else {
+            return wi_status::WI_CLOSED;
         };
+        if send.closed {
+            return wi_status::WI_CLOSED;
+        }
         send.closed = true;
-        send.stream.finish().is_ok()
+        match send.stream.finish() {
+            Ok(()) => wi_status::WI_OK,
+            Err(_) => wi_status::WI_CLOSED,
+        }
     })
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wi_send_reset(send: *const wi_send, code: u64) {
-    let send = unsafe { &*send }.0.clone();
+    let state = unsafe { &*send }.0.clone();
     guard((), || {
-        runtime().spawn(async move {
-            let mut send = send.lock().await;
+        detach(async move {
+            let mut send = state.stream.lock().await;
             send.closed = true;
             let _ = send.stream.reset(var_int(code));
         });
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wi_send_stopped(
+    send: *const wi_send,
+    callback: wi_callback,
+    context: *mut c_void,
+) -> u64 {
+    let stopped = unsafe { &*send }.0.stopped.clone();
+    spawn(callback, context, async move {
+        match stopped.await {
+            Stop::Stopped(code) => Outcome::Stopped(code),
+            Stop::Ended => Outcome::Finished,
+            Stop::Lost(reason) => Outcome::Closed(reason),
+        }
     })
 }
 
@@ -117,8 +193,11 @@ pub unsafe extern "C" fn wi_recv_read(
 ) -> u64 {
     let recv = unsafe { &*recv }.0.clone();
     spawn(callback, context, async move {
+        if max == 0 {
+            return Outcome::Error("max is 0".into());
+        }
         let mut recv = recv.lock().await;
-        let mut bytes = vec![0; max.max(1)];
+        let mut bytes = vec![0; max];
         match recv.read(&mut bytes).await {
             Ok(Some(count)) => {
                 bytes.truncate(count);
@@ -136,7 +215,7 @@ pub unsafe extern "C" fn wi_recv_read(
 pub unsafe extern "C" fn wi_recv_stop(recv: *const wi_recv, code: u64) {
     let recv = unsafe { &*recv }.0.clone();
     guard((), || {
-        runtime().spawn(async move {
+        detach(async move {
             let _ = recv.lock().await.stop(var_int(code));
         });
     })

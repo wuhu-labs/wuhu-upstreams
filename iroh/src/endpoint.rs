@@ -1,38 +1,42 @@
 //! Endpoints and connections.
 
-use std::{ffi::c_char, ffi::c_void, sync::Arc};
+use std::{
+    ffi::{c_char, c_void},
+    ptr,
+    sync::{Arc, OnceLock},
+};
 
 use iroh::{
     Endpoint, EndpointAddr, PublicKey, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
     Watcher,
-    endpoint::{Connection, ConnectionError, PathEventStream, RelayStatus, presets},
+    endpoint::{Connection, ConnectionError, presets},
 };
-use futures_util::{StreamExt, stream::BoxStream};
-use tokio::sync::Mutex;
+use futures_util::StreamExt;
 
 use crate::op::{Outcome, RunOnce, fill, guard, handle, key, spawn, text, wi_callback};
 use crate::stream::{RecvHandle, SendHandle};
+use crate::watch::wi_watch;
 
 #[allow(non_camel_case_types)]
 pub struct wi_endpoint {
     endpoint: Endpoint,
+    relay: RelayUrl,
     alpn: Vec<u8>,
-    relay_changes: Arc<Mutex<BoxStream<'static, Vec<RelayStatus>>>>,
     close: RunOnce<()>,
 }
 
 #[allow(non_camel_case_types)]
 pub struct wi_connection {
     connection: Connection,
-    path_events: Arc<Mutex<PathEventStream>>,
+    /// The code of our own `wi_connection_close`, which iroh reports only as "locally closed".
+    local_close: Arc<OnceLock<u64>>,
 }
 
 impl wi_connection {
     fn new(connection: Connection) -> Self {
-        let path_events = Arc::new(Mutex::new(connection.path_events()));
         wi_connection {
             connection,
-            path_events,
+            local_close: Arc::new(OnceLock::new()),
         }
     }
 }
@@ -65,13 +69,17 @@ pub unsafe extern "C" fn wi_endpoint_bind(
 ) -> u64 {
     let secret = SecretKey::from_bytes(&unsafe { key(secret_key) });
     let relay = relay_url(unsafe { text(relay_url_text) });
-    let alpn = unsafe { std::slice::from_raw_parts(alpn, alpn_len) }.to_vec();
+    let alpn = if alpn_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(alpn, alpn_len) }.to_vec()
+    };
     spawn(callback, context, async move {
         let relay = match relay {
             Ok(relay) => relay,
             Err(e) => return Outcome::Error(e),
         };
-        let mut config = RelayConfig::from(relay);
+        let mut config = RelayConfig::from(relay.clone());
         config.quic = None;
         let mut builder = Endpoint::builder(presets::Minimal)
             .secret_key(secret)
@@ -81,15 +89,12 @@ pub unsafe extern "C" fn wi_endpoint_bind(
             builder = builder.clear_ip_transports();
         }
         match builder.bind().await {
-            Ok(endpoint) => {
-                let changes = endpoint.home_relay_status().stream_updates_only().boxed();
-                Outcome::Handle(handle(wi_endpoint {
-                    endpoint,
-                    alpn,
-                    relay_changes: Arc::new(Mutex::new(changes)),
-                    close: RunOnce::new(),
-                }))
-            }
+            Ok(endpoint) => Outcome::Handle(handle(wi_endpoint {
+                endpoint,
+                relay,
+                alpn,
+                close: RunOnce::new(),
+            })),
             Err(e) => Outcome::error(e),
         }
     })
@@ -117,23 +122,18 @@ pub unsafe extern "C" fn wi_endpoint_key(endpoint: *const wi_endpoint, out: *mut
 pub unsafe extern "C" fn wi_endpoint_connect(
     endpoint: *const wi_endpoint,
     public_key: *const u8,
-    relay_url_text: *const c_char,
     callback: wi_callback,
     context: *mut c_void,
 ) -> u64 {
     let this = unsafe { &*endpoint };
     let endpoint = this.endpoint.clone();
     let alpn = this.alpn.clone();
+    let relay = this.relay.clone();
     let peer = PublicKey::from_bytes(&unsafe { key(public_key) });
-    let relay = relay_url(unsafe { text(relay_url_text) });
     spawn(callback, context, async move {
         let peer = match peer {
             Ok(peer) => peer,
             Err(e) => return Outcome::error(e),
-        };
-        let relay = match relay {
-            Ok(relay) => relay,
-            Err(e) => return Outcome::Error(e),
         };
         let address = EndpointAddr::new(peer).with_relay_url(relay);
         match endpoint.connect(address, &alpn).await {
@@ -222,23 +222,17 @@ pub unsafe extern "C" fn wi_endpoint_relay_state(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wi_endpoint_relay_changed(
-    endpoint: *const wi_endpoint,
-    callback: wi_callback,
-    context: *mut c_void,
-) -> u64 {
-    let this = unsafe { &*endpoint };
-    let endpoint = this.endpoint.clone();
-    let changes = this.relay_changes.clone();
-    spawn(callback, context, async move {
-        let mut changes = changes.lock().await;
-        tokio::select! {
-            changed = changes.next() => match changed {
-                Some(_) => Outcome::Ok,
-                None => Outcome::Closed("endpoint closed".into()),
-            },
-            _ = endpoint.closed() => Outcome::Closed("endpoint closed".into()),
-        }
+pub unsafe extern "C" fn wi_endpoint_relay_watch(endpoint: *const wi_endpoint) -> *mut wi_watch {
+    let endpoint = unsafe { &*endpoint }.endpoint.clone();
+    guard(ptr::null_mut(), || {
+        let closing = endpoint.clone();
+        let changes = endpoint
+            .home_relay_status()
+            .stream_updates_only()
+            .map(|_| ())
+            .take_until(async move { closing.closed().await })
+            .boxed();
+        handle(wi_watch::new(changes)) as *mut wi_watch
     })
 }
 
@@ -342,17 +336,16 @@ pub unsafe extern "C" fn wi_connection_path(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wi_connection_path_changed(
-    connection: *const wi_connection,
-    callback: wi_callback,
-    context: *mut c_void,
-) -> u64 {
-    let events = unsafe { &*connection }.path_events.clone();
-    spawn(callback, context, async move {
-        match events.lock().await.next().await {
-            Some(_) => Outcome::Ok,
-            None => Outcome::Closed("connection closed".into()),
-        }
+pub unsafe extern "C" fn wi_connection_path_watch(connection: *const wi_connection) -> *mut wi_watch {
+    let connection = &unsafe { &*connection }.connection;
+    guard(ptr::null_mut(), || {
+        let closing = connection.weak_handle();
+        let changes = connection
+            .path_events()
+            .map(|_| ())
+            .take_until(async move { closing.closed().await })
+            .boxed();
+        handle(wi_watch::new(changes)) as *mut wi_watch
     })
 }
 
@@ -362,9 +355,15 @@ pub unsafe extern "C" fn wi_connection_closed(
     callback: wi_callback,
     context: *mut c_void,
 ) -> u64 {
-    let connection = unsafe { &*connection }.connection.clone();
+    let this = unsafe { &*connection };
+    let connection = this.connection.clone();
+    let local_close = this.local_close.clone();
     spawn(callback, context, async move {
-        let (code, reason) = closed_reason(&connection.closed().await);
+        let error = connection.closed().await;
+        let (code, reason) = match (&error, local_close.get()) {
+            (ConnectionError::LocallyClosed, Some(code)) => (*code, String::new()),
+            _ => closed_reason(&error),
+        };
         Outcome::ClosedWith(code, reason)
     })
 }
@@ -374,6 +373,7 @@ pub unsafe extern "C" fn wi_connection_close(connection: *const wi_connection, c
     let connection = unsafe { &*connection };
     guard((), || {
         let code = iroh::endpoint::VarInt::from_u64(code).unwrap_or(iroh::endpoint::VarInt::MAX);
+        let _ = connection.local_close.set(code.into_inner());
         connection.connection.close(code, b"");
     })
 }

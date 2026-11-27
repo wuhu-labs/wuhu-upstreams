@@ -4102,6 +4102,8 @@ dependencies = [
  "futures-util",
  "iroh",
  "iroh-relay",
+ "libc",
+ "rcgen",
  "rustls",
  "tokio",
  "tracing",

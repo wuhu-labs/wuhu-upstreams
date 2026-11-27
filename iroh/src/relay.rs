@@ -13,7 +13,7 @@ use iroh_relay::server::{
 };
 use tokio::sync::Mutex;
 
-use crate::op::{Outcome, RunOnce, guard, handle, key, runtime, spawn, text, wi_callback};
+use crate::op::{Outcome, RunOnce, detach, guard, handle, key, spawn, text, wi_callback};
 
 #[repr(C)]
 #[allow(non_camel_case_types)]
@@ -74,14 +74,13 @@ pub struct wi_relay {
     shutdown: RunOnce<Result<(), String>>,
     service: RelayService,
     metrics: Arc<iroh_relay::server::Metrics>,
-    http: Option<SocketAddr>,
-    https: Option<SocketAddr>,
+    address: Option<SocketAddr>,
 }
 
 impl Drop for wi_relay {
     fn drop(&mut self) {
         let server = self.server.clone();
-        runtime().spawn(async move {
+        detach(async move {
             if let Some(server) = server.lock().await.take() {
                 let _ = server.shutdown().await;
             }
@@ -91,10 +90,13 @@ impl Drop for wi_relay {
 
 fn tls(address: SocketAddr, cert: &str, key: &str) -> Result<TlsConfig, String> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-    let chain = CertificateDer::pem_file_iter(cert)
-        .and_then(|certs| certs.collect::<Result<Vec<_>, _>>())
-        .map_err(|e| format!("certificate {cert}: {e}"))?;
-    let key = PrivateKeyDer::from_pem_file(key).map_err(|e| format!("key {key}: {e}"))?;
+    let chain = CertificateDer::pem_slice_iter(cert.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("certificate chain: {e}"))?;
+    if chain.is_empty() {
+        return Err("certificate chain: no certificate".into());
+    }
+    let key = PrivateKeyDer::from_pem_slice(key.as_bytes()).map_err(|e| format!("key: {e}"))?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -112,10 +114,9 @@ fn tls(address: SocketAddr, cert: &str, key: &str) -> Result<TlsConfig, String> 
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wi_relay_spawn(
-    http_address: *const c_char,
-    tls_address: *const c_char,
-    cert_pem_path: *const c_char,
-    key_pem_path: *const c_char,
+    address: *const c_char,
+    cert_chain_pem: *const c_char,
+    key_pem: *const c_char,
     access: wi_relay_access,
     callback: wi_callback,
     context: *mut c_void,
@@ -126,24 +127,29 @@ pub unsafe extern "C" fn wi_relay_spawn(
         on_disconnect: access.on_disconnect,
         release: access.release,
     };
-    let http = unsafe { text(http_address) };
-    let tls_parts = unsafe { (text(tls_address), text(cert_pem_path), text(key_pem_path)) };
+    let address = unsafe { text(address) };
+    let pem = unsafe { (text(cert_chain_pem), text(key_pem)) };
     spawn(callback, context, async move {
-        let parse = |text: Option<String>| -> Result<SocketAddr, String> {
-            let text = text.ok_or("no address")?;
-            text.parse().map_err(|e| format!("address {text}: {e}"))
+        let address: SocketAddr = match address.as_deref().map(str::parse) {
+            Some(Ok(address)) => address,
+            Some(Err(e)) => return Outcome::Error(format!("address {}: {e}", address.unwrap_or_default())),
+            None => return Outcome::Error("no address".into()),
         };
-        let mut relay = match parse(http) {
-            Ok(address) => RelayConfig::new(address),
-            Err(e) => return Outcome::Error(e),
+        let mut relay = match pem {
+            (None, None) => RelayConfig::new(address),
+            (Some(cert), Some(key)) => {
+                // iroh serves only its captive-portal check on the plain listener once TLS is on.
+                let mut relay = RelayConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+                match tls(address, &cert, &key) {
+                    Ok(config) => relay.tls = Some(config),
+                    Err(e) => return Outcome::Error(e),
+                }
+                relay
+            }
+            _ => return Outcome::Error("a certificate chain needs its key, and a key its chain".into()),
         };
         relay.access = Arc::new(access);
-        if let (Some(address), Some(cert), Some(key)) = tls_parts {
-            match parse(Some(address)).and_then(|address| tls(address, &cert, &key)) {
-                Ok(config) => relay.tls = Some(config),
-                Err(e) => return Outcome::Error(e),
-            }
-        }
+        let tls = relay.tls.is_some();
         let mut config = ServerConfig::default();
         config.relay = Some(relay);
         match Server::spawn(config).await {
@@ -154,8 +160,7 @@ pub unsafe extern "C" fn wi_relay_spawn(
                     .clone();
                 Outcome::Handle(handle(wi_relay {
                     metrics: server.metrics().server.clone(),
-                    http: server.http_addr(),
-                    https: server.https_addr(),
+                    address: if tls { server.https_addr() } else { server.http_addr() },
                     service,
                     server: Arc::new(Mutex::new(Some(server))),
                     shutdown: RunOnce::new(),
@@ -167,15 +172,10 @@ pub unsafe extern "C" fn wi_relay_spawn(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wi_relay_address(
-    relay: *const wi_relay,
-    tls: bool,
-    out: *mut c_char,
-    capacity: usize,
-) -> usize {
+pub unsafe extern "C" fn wi_relay_address(relay: *const wi_relay, out: *mut c_char, capacity: usize) -> usize {
     let relay = unsafe { &*relay };
     guard(0, || {
-        let Some(address) = (if tls { relay.https } else { relay.http }) else {
+        let Some(address) = relay.address else {
             return 0;
         };
         let text = address.to_string();

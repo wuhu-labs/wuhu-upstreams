@@ -2,12 +2,15 @@
  *
  * Threading: every function may be called from any thread. The library runs one multi-threaded
  * runtime per process, created on first use. Callbacks run on one of its threads (or, for a
- * cancelled operation, possibly on the thread calling wi_cancel) and must not block.
+ * cancelled operation, possibly on the thread calling wi_cancel) and must not block. When the
+ * runtime cannot start (the host refuses it threads, say), an operation ends at once with WI_ERROR,
+ * its callback running on the calling thread before the call returns; the next call tries again.
  *
  * Asynchronous operations take a wi_callback and an opaque context and return an operation id
  * (never 0). The callback is called exactly once per operation, with the result; the context is
  * the caller's until then. wi_cancel(id) ends a pending operation with WI_CANCELLED; it is a no-op
- * once the callback has run.
+ * once the operation has its result, so a cancel racing the end can still see OK (with any
+ * handles, which are then the caller's to free).
  *
  * Handles are owned by the caller and released with their wi_*_free. A free never waits and is
  * safe while operations on the handle are pending: those keep what they need and finish normally.
@@ -31,6 +34,7 @@ typedef struct wi_connection wi_connection;
 typedef struct wi_send wi_send;
 typedef struct wi_recv wi_recv;
 typedef struct wi_relay wi_relay;
+typedef struct wi_watch wi_watch;
 
 typedef enum wi_status {
   WI_OK = 0,
@@ -73,18 +77,19 @@ void wi_secret_key_public(const uint8_t secret_key[32], uint8_t out_public_key[3
 
 /* Binds an endpoint for `secret_key` whose only relay is `relay_url`, accepting and dialling the
  * ALPN `alpn`. No discovery service is used: a peer is addressed by (relay URL, key). With
- * `relay_only` it has no IP transport, so every path goes through the relay.
- * OK: handles[0] is the wi_endpoint. ERROR: message. */
+ * `relay_only` it has no IP transport, so every path goes through the relay. `alpn` may be NULL
+ * when `alpn_len` is 0. OK: handles[0] is the wi_endpoint. ERROR: message. */
 uint64_t wi_endpoint_bind(const uint8_t secret_key[32], const char *relay_url, bool relay_only,
                           const uint8_t *alpn, size_t alpn_len, wi_callback callback,
                           void *context);
 
 void wi_endpoint_key(const wi_endpoint *endpoint, uint8_t out_public_key[32]);
 
-/* Dials `public_key` through `relay_url`. OK: handles[0] is the wi_connection, bytes the
- * verified 32-byte key. ERROR or CLOSED: message. */
+/* Dials `public_key` through the endpoint's own relay, the only relay URL this library ever hands
+ * iroh. OK: handles[0] is the wi_connection, bytes the verified 32-byte key. ERROR or CLOSED:
+ * message. */
 uint64_t wi_endpoint_connect(const wi_endpoint *endpoint, const uint8_t public_key[32],
-                             const char *relay_url, wi_callback callback, void *context);
+                             wi_callback callback, void *context);
 
 /* The next incoming connection whose handshake completes. OK: handles[0] is the wi_connection,
  * bytes the caller's 32-byte Ed25519 key as the handshake verified it. CLOSED once the endpoint
@@ -105,10 +110,9 @@ typedef struct wi_relay_state {
 /* The home relay's state now; false before the endpoint has picked its home relay. */
 bool wi_endpoint_relay_state(const wi_endpoint *endpoint, wi_relay_state *out);
 
-/* OK at the relay state's next change since the last such change was reported (or since bind);
- * CLOSED once the endpoint is closed. One pending call per endpoint. */
-uint64_t wi_endpoint_relay_changed(const wi_endpoint *endpoint, wi_callback callback,
-                                   void *context);
+/* A cursor over the home relay state's changes from now on, for wi_watch_next; NULL on failure.
+ * Every cursor sees every change. */
+wi_watch *wi_endpoint_relay_watch(const wi_endpoint *endpoint);
 
 /* Closes every connection and the endpoint. OK when done. The close runs to its end even when this
  * call is cancelled; a later call waits for the same close. */
@@ -140,13 +144,13 @@ typedef struct wi_path {
 /* The path the connection sends on now; false when it has none or is closed. */
 bool wi_connection_path(const wi_connection *connection, wi_path *out);
 
-/* OK at the next path event (a path opened, closed or was selected) since the last one reported;
- * CLOSED once the connection is closed: message. One pending call per connection. */
-uint64_t wi_connection_path_changed(const wi_connection *connection, wi_callback callback,
-                                    void *context);
+/* A cursor over the connection's path events (a path opened, closed or was selected) from now on,
+ * for wi_watch_next; NULL on failure. Every cursor sees every event. */
+wi_watch *wi_connection_path_watch(const wi_connection *connection);
 
-/* CLOSED when the connection closes: code is the peer's or our application close code (0 for any
- * other cause), message the reason. */
+/* CLOSED when the connection closes: code is the peer's application close code, or ours as given
+ * to wi_connection_close, 0 for any other cause; message the peer's reason or the cause (empty
+ * for our own close). */
 uint64_t wi_connection_closed(const wi_connection *connection, wi_callback callback,
                               void *context);
 
@@ -163,18 +167,23 @@ void wi_connection_free(wi_connection *connection);
 uint64_t wi_send_write(const wi_send *send, const uint8_t *bytes, size_t len,
                        wi_callback callback, void *context);
 
-/* Ends the stream after what was written; false when it is already finished or reset, or a write
- * is pending. */
-bool wi_send_finish(const wi_send *send);
+/* Ends the stream after what was written. OK; CLOSED when it is already finished or reset; ERROR,
+ * finishing nothing, while a write is pending (from its call until its callback). */
+wi_status wi_send_finish(const wi_send *send);
 
 /* Abandons the stream with `code` once no write is pending (cancel a pending write first). */
 void wi_send_reset(const wi_send *send, uint64_t code);
 
+/* STOPPED once the peer stops the stream: code. FINISHED once a finished stream's data is all
+ * acknowledged. CLOSED when the connection is lost first: message. Any number may be pending. */
+uint64_t wi_send_stopped(const wi_send *send, wi_callback callback, void *context);
+
 /* Drops the handle; a stream neither finished nor reset is reset with code 0. */
 void wi_send_free(wi_send *send);
 
-/* Reads up to `max` bytes. OK: bytes and len (at least 1). FINISHED at the peer's finish.
- * RESET: code. CLOSED or ERROR: message. One pending read per stream. */
+/* Reads up to `max` bytes, `max` at least 1 (0 is ERROR and reads nothing). OK: bytes and len (at
+ * least 1). FINISHED at the peer's finish. RESET: code. CLOSED or ERROR: message. One pending
+ * read per stream. */
 uint64_t wi_recv_read(const wi_recv *recv, size_t max, wi_callback callback, void *context);
 
 /* Asks the peer to stop sending with `code` once no read is pending (cancel a pending read first). */
@@ -196,18 +205,18 @@ typedef struct wi_relay_access {
   void (*release)(void *context);
 } wi_relay_access;
 
-/* Serves an iroh relay on `http_address` ("host:port", port 0 picks one). Without a certificate
- * it serves the relay over plain HTTP there (for a TLS-terminating proxy in front of it); with
- * `tls_address`, `cert_pem_path` and `key_pem_path` it also serves HTTPS on `tls_address` with
- * that certificate chain and key. The relay owns `access` from this call on, failure included.
- * OK: handles[0] is the wi_relay. ERROR: message. */
-uint64_t wi_relay_spawn(const char *http_address, const char *tls_address,
-                        const char *cert_pem_path, const char *key_pem_path,
+/* Serves an iroh relay on `address` ("host:port", port 0 picks one): over plain HTTP when both
+ * PEM texts are NULL (for a TLS-terminating proxy in front of it), over HTTPS with that
+ * certificate chain and key when both are given. With TLS, iroh also keeps a plain listener on
+ * 127.0.0.1 with a port of its own that answers only its captive-portal check, never the relay.
+ * The relay owns `access` from this call on, failure included. OK: handles[0] is the wi_relay.
+ * ERROR: message. */
+uint64_t wi_relay_spawn(const char *address, const char *cert_chain_pem, const char *key_pem,
                         wi_relay_access access, wi_callback callback, void *context);
 
-/* The bound address ("ip:port") of the HTTP (tls false) or HTTPS listener into `out`; returns its
- * length, 0 when that listener does not exist or `capacity` is too small. */
-size_t wi_relay_address(const wi_relay *relay, bool tls, char *out, size_t capacity);
+/* The relay's bound address ("ip:port") into `out`; returns its length, 0 when `capacity` is too
+ * small. */
+size_t wi_relay_address(const wi_relay *relay, char *out, size_t capacity);
 
 /* Bytes the relay has sent to and received from its clients since it started. */
 void wi_relay_traffic(const wi_relay *relay, uint64_t *out_sent, uint64_t *out_received);
@@ -221,6 +230,14 @@ uint64_t wi_relay_shutdown(const wi_relay *relay, wi_callback callback, void *co
 
 /* Drops the handle; a relay not shut down is shut down in the background. */
 void wi_relay_free(wi_relay *relay);
+
+/* ---- Watch ------------------------------------------------------------------------------- */
+
+/* OK at the cursor's next change since the last one it reported (or since it was made); CLOSED
+ * once its endpoint or connection is closed. One pending call per cursor. */
+uint64_t wi_watch_next(const wi_watch *watch, wi_callback callback, void *context);
+
+void wi_watch_free(wi_watch *watch);
 
 #ifdef __cplusplus
 }
