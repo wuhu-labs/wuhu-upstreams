@@ -4,7 +4,10 @@ use std::{
     ffi::{c_char, c_void},
     net::{IpAddr, SocketAddr},
     ptr,
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use futures_util::StreamExt;
@@ -13,9 +16,13 @@ use iroh::{
     Watcher,
     endpoint::{Connection, ConnectionError, VarInt, presets},
 };
-use tokio::task::AbortHandle;
+use tokio::{
+    task::AbortHandle,
+    time::{Instant, sleep_until},
+};
 
 use crate::op::{Outcome, RunOnce, fill, guard, handle, key, spawn, text, wi_callback};
+use crate::pacing::Pacing;
 use crate::stream::{RecvHandle, SendHandle};
 use crate::watch::wi_watch;
 
@@ -27,6 +34,7 @@ pub struct wi_endpoint {
     close: RunOnce<()>,
     connections: Arc<Mutex<Connections>>,
     failover: AbortHandle,
+    failovers: Arc<AtomicU64>,
 }
 
 impl Drop for wi_endpoint {
@@ -110,23 +118,46 @@ fn relay_config(url: RelayUrl, auth_token: Option<String>) -> Arc<RelayConfig> {
 }
 
 /// iroh moves its home relay only after a net report, which runs every 20 to 26 s; a relay map
-/// change runs one at once, so each failure of the home relay's connection re-inserts its entry.
-async fn fail_over(endpoint: Endpoint, relays: RelayMap) {
+/// change runs one at once, so a failure of the home relay's connection re-inserts its entry, as
+/// often as `Pacing` allows.
+async fn fail_over(endpoint: Endpoint, relays: RelayMap, failovers: Arc<AtomicU64>) {
     let closing = endpoint.clone();
     let mut statuses = endpoint
         .home_relay_status()
         .stream_updates_only()
         .take_until(async move { closing.closed().await })
         .boxed();
-    while let Some(statuses) = statuses.next().await {
-        let Some(home) = statuses.first() else {
-            continue;
-        };
-        if home.is_connected() || home.last_error().is_none() {
+    let mut pacing = Pacing::new(Instant::now());
+    let mut failed: Option<RelayUrl> = None;
+    loop {
+        tokio::select! {
+            next = statuses.next() => {
+                let Some(statuses) = next else {
+                    return;
+                };
+                let Some(home) = statuses.first() else {
+                    continue;
+                };
+                if home.is_connected() {
+                    pacing.connected(Instant::now());
+                    failed = None;
+                } else if home.last_error().is_some() {
+                    failed = Some(home.url().clone());
+                }
+            }
+            () = sleep_until(pacing.ready_at), if failed.is_some() => {}
+        }
+        let now = Instant::now();
+        if now < pacing.ready_at {
             continue;
         }
-        if let Some(config) = relays.get(home.url()) {
-            endpoint.insert_relay(home.url().clone(), config).await;
+        let Some(url) = failed.take() else {
+            continue;
+        };
+        pacing.fired(now);
+        failovers.fetch_add(1, Ordering::Relaxed);
+        if let Some(config) = relays.get(&url) {
+            endpoint.insert_relay(url, config).await;
         }
     }
 }
@@ -178,8 +209,13 @@ pub unsafe extern "C" fn wi_endpoint_bind(
         }
         match builder.bind().await {
             Ok(endpoint) => {
-                let failover =
-                    tokio::spawn(fail_over(endpoint.clone(), relays.clone())).abort_handle();
+                let failovers = Arc::new(AtomicU64::new(0));
+                let failover = tokio::spawn(fail_over(
+                    endpoint.clone(),
+                    relays.clone(),
+                    failovers.clone(),
+                ))
+                .abort_handle();
                 Outcome::Handle(handle(wi_endpoint {
                     endpoint,
                     relays,
@@ -187,6 +223,7 @@ pub unsafe extern "C" fn wi_endpoint_bind(
                     close: RunOnce::new(),
                     connections: Default::default(),
                     failover,
+                    failovers,
                 }))
             }
             Err(e) => Outcome::error(e),
@@ -637,4 +674,10 @@ pub unsafe extern "C" fn wi_connection_free(connection: *mut wi_connection) {
 pub unsafe fn net_reports(endpoint: *const c_void) -> u64 {
     let this = unsafe { &*(endpoint as *const wi_endpoint) };
     this.endpoint.metrics().net_report.reports.get()
+}
+
+#[doc(hidden)]
+pub unsafe fn failovers(endpoint: *const c_void) -> u64 {
+    let this = unsafe { &*(endpoint as *const wi_endpoint) };
+    this.failovers.load(Ordering::Relaxed)
 }

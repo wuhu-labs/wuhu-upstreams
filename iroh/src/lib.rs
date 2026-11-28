@@ -2,6 +2,7 @@
 
 mod endpoint;
 mod op;
+mod pacing;
 mod relay;
 mod stream;
 mod watch;
@@ -10,3 +11,7 @@ mod watch;
 /// `wi_endpoint`) has run.
 #[doc(hidden)]
 pub use endpoint::net_reports;
+
+/// For the crate's own tests: how many failovers `endpoint` has started.
+#[doc(hidden)]
+pub use endpoint::failovers;

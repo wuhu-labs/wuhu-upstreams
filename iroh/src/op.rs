@@ -89,7 +89,12 @@ impl Reply {
 impl Drop for Reply {
     fn drop(&mut self) {
         if !self.done {
-            deliver(self.callback, self.context, Outcome::Cancelled, self.held.take());
+            deliver(
+                self.callback,
+                self.context,
+                Outcome::Cancelled,
+                self.held.take(),
+            );
         }
     }
 }

@@ -87,13 +87,16 @@ typedef struct wi_relay_entry {
  * copied before return), accepting and dialling the ALPN `alpn`. No discovery service is used: a
  * peer is addressed by its key, a relay URL and direct addresses. iroh keeps one standing
  * connection, to its home relay: the map relay its last net report found nearest. It only probes
- * the others (over HTTPS, at bind and every 20 to 26 s). Each failed connection or redial of the
- * home relay runs a full net report at once (redials follow iroh's backoff, 10 ms doubling to
- * 16 s), which makes the nearest relay that answers its probe home, the old home included when it
- * answers: on localhost a refused home is replaced in about half a second; a relay that drops
- * packets instead holds the report up to its probe timeout (3 s) and its own (5 s), then a dial
- * to the new home follows. With every relay down the home stays and is redialled. With `relay_only` it has no IP transport, so every path goes through a relay.
- * `alpn` may be NULL when `alpn_len` is 0. OK: handles[0] is the wi_endpoint. ERROR: message. */
+ * the others (over HTTPS, at bind and every 20 to 26 s). A failed connection or redial of the home
+ * relay (redials follow iroh's backoff, 10 ms doubling to 16 s) runs a full net report: the first
+ * at once, each later one while the home stays down after a gap doubling from 0.5 s to 16 s, so a
+ * long outage runs at most one such report every 16 s beside iroh's own. The report makes the
+ * nearest relay that answers its probe home, the old home included when it answers: on localhost a
+ * refused home is replaced in about half a second; a relay that drops packets instead holds the
+ * report up to its probe timeout (3 s) and its own (5 s), then a dial to the new home follows.
+ * With every relay down the home stays and is redialled. With `relay_only` it has no IP transport,
+ * so every path goes through a relay. `alpn` may be NULL when `alpn_len` is 0. OK: handles[0] is
+ * the wi_endpoint. ERROR: message. */
 uint64_t wi_endpoint_bind(const uint8_t secret_key[32], const wi_relay_entry *relays,
                           size_t relay_count, bool relay_only, const uint8_t *alpn,
                           size_t alpn_len, wi_callback callback, void *context);
@@ -252,8 +255,9 @@ void wi_recv_free(wi_recv *recv);
 /* Admission for the relay. on_connect runs for each client the relay handshake authenticated and
  * decides whether it is admitted; `auth_token` is the client's bearer token (its Authorization
  * header, else its `token` query parameter), NUL-terminated and valid during the call, or NULL;
- * on_disconnect runs exactly once for each admitted connection when it ends. `connection` is unique per process. Both may run concurrently on runtime threads.
- * release(context) runs once, after the last callback, when the relay is gone. */
+ * on_disconnect runs exactly once for each admitted connection when it ends. `connection` is
+ * unique per process. Both may run concurrently on runtime threads. release(context) runs once,
+ * after the last callback, when the relay is gone. */
 typedef struct wi_relay_access {
   void *context;
   bool (*on_connect)(void *context, const uint8_t public_key[32], uint64_t connection,

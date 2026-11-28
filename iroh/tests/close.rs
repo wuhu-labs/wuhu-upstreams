@@ -10,7 +10,9 @@ use std::{
 use common::*;
 
 fn closed(connection: *mut c_void) -> Done {
-    let closed = wait(call(|cb, cx| unsafe { wi_connection_closed(connection, cb, cx) }));
+    let closed = wait(call(|cb, cx| unsafe {
+        wi_connection_closed(connection, cb, cx)
+    }));
     assert_eq!(closed.status, 4, "{closed:?}");
     closed
 }
@@ -18,11 +20,21 @@ fn closed(connection: *mut c_void) -> Done {
 #[test]
 fn a_close_after_the_endpoint_closed_the_connection_keeps_its_cause() {
     let link = Link::new([31, 32]);
-    ok(call(|cb, cx| unsafe { wi_endpoint_close(link.endpoints[1], cb, cx) }));
+    ok(call(|cb, cx| unsafe {
+        wi_endpoint_close(link.endpoints[1], cb, cx)
+    }));
     assert_eq!(closed(link.outgoing).code, 0);
     unsafe { wi_connection_close(link.outgoing, 7) };
-    assert_eq!(closed(link.outgoing).code, 0, "the endpoint's close took effect, not ours");
-    assert_eq!(closed(link.incoming).code, 0, "the peer saw the endpoint's close");
+    assert_eq!(
+        closed(link.outgoing).code,
+        0,
+        "the endpoint's close took effect, not ours"
+    );
+    assert_eq!(
+        closed(link.incoming).code,
+        0,
+        "the peer saw the endpoint's close"
+    );
 }
 
 #[test]

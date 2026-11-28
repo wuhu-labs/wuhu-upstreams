@@ -241,7 +241,7 @@ fn with_every_relay_down_the_endpoint_runs_no_report_loop() {
     std::thread::sleep(Duration::from_secs(4));
     let reports = unsafe { wuhu_iroh::net_reports(endpoint) } - before;
     eprintln!("{reports} net reports in 4 s with every relay down");
-    // One per failed redial at most: iroh's backoff doubles from 10 ms, so about 9 in 4 s.
+    // Failovers at 0, 0.5, 1.5 and 3.5 s at most, beside the reports at bind.
     assert!(reports <= 12, "{reports} net reports in 4 s");
     let states = relays(endpoint);
     let stayed = states
@@ -460,4 +460,30 @@ fn direct_addresses_are_dialable_ones_and_a_dial_by_address_alone_connects() {
     close(client);
     close(server);
     unsafe { wi_relay_free(relay) };
+}
+
+#[test]
+fn relays_that_refuse_every_dial_start_failovers_at_a_doubling_gap_only() {
+    let refusing = || {
+        spawn_relay_access(Access {
+            context: ptr::null_mut(),
+            on_connect: Some(deny),
+            on_disconnect: None,
+            release: None,
+        })
+    };
+    let (relay_a, url_a) = refusing();
+    let (relay_b, url_b) = refusing();
+    let endpoint = bind_to(41, &[(&url_a, None), (&url_b, None)]);
+    std::thread::sleep(Duration::from_secs(4));
+    let failovers = unsafe { wuhu_iroh::failovers(endpoint) };
+    let reports = unsafe { wuhu_iroh::net_reports(endpoint) };
+    eprintln!("{failovers} failovers and {reports} net reports in 4 s, every dial refused");
+    // Gaps of 0.5, 1 and 2 s after the first: four by 3.5 s, however often iroh redials.
+    assert!((2..=4).contains(&failovers), "{failovers} failovers in 4 s");
+    close(endpoint);
+    unsafe {
+        wi_relay_free(relay_a);
+        wi_relay_free(relay_b);
+    }
 }

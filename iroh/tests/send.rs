@@ -14,13 +14,17 @@ use std::{
 use common::*;
 
 fn soon(receiver: std::sync::mpsc::Receiver<Done>) -> Done {
-    receiver.recv_timeout(Duration::from_secs(2)).expect("callback within 2 s")
+    receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("callback within 2 s")
 }
 
 /// The peer's reading until the stream ends, by its reset or its finish.
 fn read_to_reset(recv: *mut c_void) -> Done {
     loop {
-        let read = wait(call(|cb, cx| unsafe { wi_recv_read(recv, 1 << 20, cb, cx) }));
+        let read = wait(call(|cb, cx| unsafe {
+            wi_recv_read(recv, 1 << 20, cb, cx)
+        }));
         if read.status != 0 {
             return read;
         }
@@ -35,7 +39,11 @@ fn a_local_reset_ends_stopped_at_once_with_its_code_again_and_again() {
         let pending = call(|cb, cx| unsafe { wi_send_stopped(send, cb, cx) });
         unsafe { wi_send_reset(send, 5) };
         let pending = soon(pending);
-        assert_eq!((pending.status, pending.code), (2, 5), "pending: {pending:?}");
+        assert_eq!(
+            (pending.status, pending.code),
+            (2, 5),
+            "pending: {pending:?}"
+        );
         let read = read_to_reset(peer_recv);
         assert_eq!((read.status, read.code), (2, 5), "the peer reads the reset");
         let later = soon(call(|cb, cx| unsafe { wi_send_stopped(send, cb, cx) }));
@@ -92,7 +100,12 @@ fn a_finish_while_a_write_copies_its_bytes_finishes_nothing() {
     let finishes = finisher.join().unwrap();
     assert!(!finishes.is_empty(), "the finisher ran during the call");
     let finished = finishes.iter().filter(|&&f| f != 6).count();
-    assert_eq!(finished, 0, "of {} finishes during the call, {finished} were not ERROR", finishes.len());
+    assert_eq!(
+        finished,
+        0,
+        "of {} finishes during the call, {finished} were not ERROR",
+        finishes.len()
+    );
     unsafe { wi_send_reset(send, 0) };
     assert_eq!(wait(write).status, 2);
     unsafe {
