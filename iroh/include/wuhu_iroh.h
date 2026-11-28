@@ -92,7 +92,8 @@ typedef struct wi_relay_entry {
  * is below 2/3 of the old one's: two similarly near relays can trade home on a missed probe or on
  * jitter, and a home relay that recovers from an outage is not guaranteed to be home again. A full
  * report (at bind, every 5 minutes, after a map or network change, after a relay's first failure)
- * keeps no history, so the 2/3 rule does not apply to it: it takes its own best latency.
+ * drops the 2/3 rule but still weighs the last 5 minutes of reports: it may make home a relay that
+ * was faster over those minutes than the best of its own probes.
  * iroh redials a failed relay with its backoff, 10 ms doubling to 16 s. A relay whose latest
  * connection failed before it was established (at its first pong: a refused token, a broken
  * upgrade, a failed dial, silence before that pong) is passed over as home while the report

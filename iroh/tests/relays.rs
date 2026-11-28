@@ -532,8 +532,8 @@ fn a_home_relay_that_answers_probes_but_refuses_every_connection_loses_home_to_o
     assert!(!a.last_error().is_empty(), "{a:?}");
 
     for _ in 0..3 {
-        // Returns once a full report completed, A probed in it.
-        unsafe { wuhu_iroh::run_net_report(endpoint) };
+        // Returns once a full report with a probe of A was published.
+        unsafe { wuhu_iroh::run_net_report(endpoint, url_a.to_str().unwrap()) };
         let until = Instant::now() + Duration::from_millis(700);
         while Instant::now() < until {
             assert_eq!(
@@ -580,7 +580,7 @@ fn a_failed_relay_that_admits_again_is_home_again_when_the_other_goes_down() {
         connected_home(endpoint),
         relays(endpoint)
     );
-    unsafe { wuhu_iroh::run_net_report(endpoint) };
+    unsafe { wuhu_iroh::run_net_report(endpoint, url_a.to_str().unwrap()) };
     let until = Instant::now() + Duration::from_secs(1);
     while Instant::now() < until {
         assert_eq!(connected_home(endpoint), Some(reported(&url_a)));

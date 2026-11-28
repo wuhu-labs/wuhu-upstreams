@@ -734,28 +734,41 @@ pub unsafe fn net_reports(endpoint: *const c_void) -> u64 {
 }
 
 #[cfg(feature = "test-hooks")]
-pub unsafe fn run_net_report(endpoint: *const c_void) {
+/// Runs full net reports and returns once one that started after the call was published, to
+/// the endpoint's selection, with a probe of `relay`. Panics after 20 s without one.
+pub unsafe fn run_net_report(endpoint: *const c_void, relay: &str) {
     let endpoint = unsafe { &*(endpoint as *const wi_endpoint) }
         .endpoint
         .clone();
+    let relay: RelayUrl = relay.parse().expect("a relay URL");
     let runtime = runtime().expect("a runtime");
     runtime.block_on(async move {
         // Removing a relay the map doesn't hold changes no entry and no token, and asks for a
         // full report as every map change does.
         let absent: RelayUrl = "http://wuhu-iroh-report.invalid".parse().expect("a URL");
         let full = || endpoint.metrics().net_report.reports_full.get();
-        let wait_for = |count: u64| async move {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-            while full() < count {
-                assert!(tokio::time::Instant::now() < deadline, "no full net report");
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
         let before = full();
         endpoint.remove_relay(&absent).await;
-        wait_for(before + 1).await;
-        // Reports run one at a time, so the next full one starts only once that one completed.
+        // Once that full report started, a report running at the call has published or
+        // stopped: what this watcher sees next comes from a full report started after the call.
+        while full() < before + 1 {
+            assert!(tokio::time::Instant::now() < deadline, "no full net report");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let mut published = endpoint.net_report();
+        // That report may have published already: another full one follows it.
         endpoint.remove_relay(&absent).await;
-        wait_for(before + 2).await;
+        loop {
+            let report = tokio::time::timeout_at(deadline, published.updated())
+                .await
+                .unwrap_or_else(|_| panic!("no full net report with a probe of {relay} published"))
+                .expect("the endpoint is open");
+            if report
+                .is_some_and(|report| report.relay_latency.iter().any(|(_, url, _)| *url == relay))
+            {
+                return;
+            }
+        }
     });
 }
