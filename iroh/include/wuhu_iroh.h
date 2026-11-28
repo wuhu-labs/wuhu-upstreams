@@ -128,29 +128,32 @@ uint64_t wi_endpoint_network_change(const wi_endpoint *endpoint, wi_callback cal
                                     void *context);
 
 typedef enum wi_relay_kind {
-  /* The relay iroh keeps its standing connection to: connected and last_error say how it is. */
-  WI_RELAY_HOME = 0,
+  /* The home relay, the one iroh keeps its standing connection to, and it is connected. */
+  WI_RELAY_HOME_CONNECTED = 0,
+  /* The home relay, dialing; last_error is this relay's previous failure, empty when it has none. */
+  WI_RELAY_HOME_CONNECTING = 1,
+  /* The home relay, not connected; last_error says why (never empty). */
+  WI_RELAY_HOME_DISCONNECTED = 2,
   /* Not connected; the last net report reached it, in latency_micros. */
-  WI_RELAY_REACHABLE = 1,
+  WI_RELAY_REACHABLE = 3,
   /* Not connected; the last net report did not reach it. */
-  WI_RELAY_UNREACHABLE = 2,
+  WI_RELAY_UNREACHABLE = 4,
   /* Not connected; no net report has finished yet. */
-  WI_RELAY_UNPROBED = 3,
+  WI_RELAY_UNPROBED = 5,
 } wi_relay_kind;
 
-/* One relay of the map. connected and last_error are set only for WI_RELAY_HOME (last_error is
- * empty when it has none), latency_micros only for WI_RELAY_REACHABLE. */
+/* One relay of the map. last_error is set only for WI_RELAY_HOME_CONNECTING and
+ * WI_RELAY_HOME_DISCONNECTED, latency_micros only for WI_RELAY_REACHABLE. */
 typedef struct wi_relay_state {
   /* NUL-terminated, truncated to fit. */
   char url[256];
   wi_relay_kind kind;
-  bool connected;
   char last_error[256];
   uint64_t latency_micros;
 } wi_relay_state;
 
 /* Fills up to `capacity` states, one per relay of the map in URL order, and returns how many the
- * map has (a larger number than `capacity` fills only `capacity`). No relay is WI_RELAY_HOME until
+ * map has (a larger number than `capacity` fills only `capacity`). No relay is a home kind until
  * the endpoint has picked its home. */
 size_t wi_endpoint_relays(const wi_endpoint *endpoint, wi_relay_state *out, size_t capacity);
 

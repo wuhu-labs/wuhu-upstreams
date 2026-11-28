@@ -4,7 +4,6 @@ mod common;
 
 use std::{
     ffi::{CStr, CString, c_char, c_void},
-    net::{Shutdown, TcpListener, TcpStream},
     ptr,
     sync::Mutex,
     time::{Duration, Instant},
@@ -203,8 +202,10 @@ fn the_home_relay_fails_over_to_another_relay_of_the_map_within_five_seconds() {
     let states = relays(endpoint);
     assert_eq!(states.len(), 2);
     let probed = states.iter().find(|state| state.url() == other).unwrap();
-    assert_ne!(probed.kind, HOME);
-    assert!(!probed.connected, "only the home relay reads as connected");
+    assert!(
+        !is_home(probed.kind),
+        "only the home relay reads as connected"
+    );
 
     let started = Instant::now();
     shut_down(dead);
@@ -217,7 +218,7 @@ fn the_home_relay_fails_over_to_another_relay_of_the_map_within_five_seconds() {
     eprintln!("failover took {:?}", started.elapsed());
     let states = relays(endpoint);
     let old = states.iter().find(|state| state.url() == home).unwrap();
-    assert_ne!(old.kind, HOME);
+    assert!(!is_home(old.kind));
     close(endpoint);
     unsafe {
         wi_relay_free(relay_a);
@@ -246,52 +247,20 @@ fn with_every_relay_down_the_endpoint_runs_no_report_loop() {
     let states = relays(endpoint);
     let stayed = states
         .iter()
-        .find(|state| state.kind == HOME)
+        .find(|state| is_home(state.kind))
         .expect("a home relay");
     assert_eq!(
         stayed.url(),
         home,
         "with nowhere better to go the home stays"
     );
-    assert!(!stayed.connected);
+    assert_ne!(stayed.kind, HOME_CONNECTED);
     assert!(!stayed.last_error().is_empty());
     close(endpoint);
     unsafe {
         wi_relay_free(relay_a);
         wi_relay_free(relay_b);
     }
-}
-
-/// A plain TCP forwarder to `target` that holds each new connection 40 ms before forwarding it, so a
-/// relay behind it probes slower than one reached directly.
-fn slow_proxy(target: &CString) -> CString {
-    let target = target
-        .to_str()
-        .unwrap()
-        .trim_start_matches("http://")
-        .to_string();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = CString::new(format!("http://{}", listener.local_addr().unwrap())).unwrap();
-    std::thread::spawn(move || {
-        for client in listener.incoming().flatten() {
-            let target = target.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(40));
-                let Ok(server) = TcpStream::connect(&target) else {
-                    return;
-                };
-                let (mut c, mut s) = (client.try_clone().unwrap(), server.try_clone().unwrap());
-                std::thread::spawn(move || {
-                    let _ = std::io::copy(&mut c, &mut s);
-                    let _ = s.shutdown(Shutdown::Write);
-                });
-                let (mut s, mut c) = (server, client);
-                let _ = std::io::copy(&mut s, &mut c);
-                let _ = c.shutdown(Shutdown::Write);
-            });
-        }
-    });
-    url
 }
 
 /// The home relay refuses the endpoint for a while, so its redials fail and each runs a net report,
@@ -342,7 +311,8 @@ fn a_home_relay_that_comes_back_first_keeps_the_endpoint() {
 }
 
 #[test]
-fn a_relay_that_refuses_the_endpoint_is_redialled_with_backoff_only() {
+fn a_relay_that_refuses_the_endpoint_is_redialled_with_backoff_only_and_each_redial_names_the_failure()
+ {
     let (relay, url) = spawn_relay_access(Access {
         context: ptr::null_mut(),
         on_connect: Some(deny),
@@ -351,13 +321,30 @@ fn a_relay_that_refuses_the_endpoint_is_redialled_with_backoff_only() {
     });
     let endpoint = bind(37, &url);
     let before = unsafe { wuhu_iroh::net_reports(endpoint) };
-    std::thread::sleep(Duration::from_secs(3));
+    let started = Instant::now();
+    let (mut failed, mut redialling) = (false, 0);
+    while started.elapsed() < Duration::from_secs(3) {
+        let state = &relays(endpoint)[0];
+        let error = state.last_error();
+        match state.kind {
+            HOME_DISCONNECTED => {
+                assert!(!error.is_empty(), "disconnected without an error");
+                failed = true;
+            }
+            HOME_CONNECTING if failed => {
+                assert!(!error.is_empty(), "a redial forgot the failure");
+                redialling += 1;
+            }
+            HOME_CONNECTING => assert!(error.is_empty(), "{error}"),
+            HOME_CONNECTED => panic!("connected to a relay that refuses"),
+            _ => assert!(!failed, "no longer home after a failure"),
+        }
+        std::thread::sleep(Duration::from_micros(200));
+    }
     let reports = unsafe { wuhu_iroh::net_reports(endpoint) } - before;
-    eprintln!("{reports} net reports in 3 s while refused");
+    eprintln!("{reports} net reports in 3 s while refused, {redialling} samples redialling");
     assert!(reports <= 12, "{reports} net reports in 3 s");
-    let state = &relays(endpoint)[0];
-    assert_eq!((state.kind, state.connected), (HOME, false));
-    assert!(!state.last_error().is_empty());
+    assert!(failed && redialling > 0);
     close(endpoint);
     unsafe { wi_relay_free(relay) };
 }

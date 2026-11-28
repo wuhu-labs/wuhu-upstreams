@@ -1,6 +1,7 @@
 //! Endpoints and connections.
 
 use std::{
+    collections::HashMap,
     ffi::{c_char, c_void},
     net::{IpAddr, SocketAddr},
     ptr,
@@ -35,7 +36,12 @@ pub struct wi_endpoint {
     connections: Arc<Mutex<Connections>>,
     failover: AbortHandle,
     failovers: Arc<AtomicU64>,
+    errors: Arc<Mutex<LastErrors>>,
 }
+
+/// Each relay's last connection error, as the failover task saw it: iroh drops it once a redial
+/// starts, while a redial is still the relay that failed.
+type LastErrors = HashMap<RelayUrl, String>;
 
 impl Drop for wi_endpoint {
     fn drop(&mut self) {
@@ -119,8 +125,13 @@ fn relay_config(url: RelayUrl, auth_token: Option<String>) -> Arc<RelayConfig> {
 
 /// iroh moves its home relay only after a net report, which runs every 20 to 26 s; a relay map
 /// change runs one at once, so a failure of the home relay's connection re-inserts its entry, as
-/// often as `Pacing` allows.
-async fn fail_over(endpoint: Endpoint, relays: RelayMap, failovers: Arc<AtomicU64>) {
+/// often as `Pacing` allows. It also keeps each relay's last error in `errors`.
+async fn fail_over(
+    endpoint: Endpoint,
+    relays: RelayMap,
+    failovers: Arc<AtomicU64>,
+    errors: Arc<Mutex<LastErrors>>,
+) {
     let closing = endpoint.clone();
     let mut statuses = endpoint
         .home_relay_status()
@@ -138,10 +149,13 @@ async fn fail_over(endpoint: Endpoint, relays: RelayMap, failovers: Arc<AtomicU6
                 let Some(home) = statuses.first() else {
                     continue;
                 };
+                let mut last_errors = errors.lock().unwrap_or_else(|e| e.into_inner());
                 if home.is_connected() {
+                    last_errors.remove(home.url());
                     pacing.connected(Instant::now());
                     failed = None;
-                } else if home.last_error().is_some() {
+                } else if let Some(error) = home.last_error() {
+                    last_errors.insert(home.url().clone(), format!("{error:#}"));
                     failed = Some(home.url().clone());
                 }
             }
@@ -210,10 +224,12 @@ pub unsafe extern "C" fn wi_endpoint_bind(
         match builder.bind().await {
             Ok(endpoint) => {
                 let failovers = Arc::new(AtomicU64::new(0));
+                let errors = Arc::new(Mutex::new(LastErrors::new()));
                 let failover = tokio::spawn(fail_over(
                     endpoint.clone(),
                     relays.clone(),
                     failovers.clone(),
+                    errors.clone(),
                 ))
                 .abort_handle();
                 Outcome::Handle(handle(wi_endpoint {
@@ -224,6 +240,7 @@ pub unsafe extern "C" fn wi_endpoint_bind(
                     connections: Default::default(),
                     failover,
                     failovers,
+                    errors,
                 }))
             }
             Err(e) => Outcome::error(e),
@@ -384,10 +401,12 @@ pub unsafe extern "C" fn wi_endpoint_network_change(
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[allow(non_camel_case_types, dead_code)]
 pub enum wi_relay_kind {
-    WI_RELAY_HOME = 0,
-    WI_RELAY_REACHABLE = 1,
-    WI_RELAY_UNREACHABLE = 2,
-    WI_RELAY_UNPROBED = 3,
+    WI_RELAY_HOME_CONNECTED = 0,
+    WI_RELAY_HOME_CONNECTING = 1,
+    WI_RELAY_HOME_DISCONNECTED = 2,
+    WI_RELAY_REACHABLE = 3,
+    WI_RELAY_UNREACHABLE = 4,
+    WI_RELAY_UNPROBED = 5,
 }
 
 #[repr(C)]
@@ -395,7 +414,6 @@ pub enum wi_relay_kind {
 pub struct wi_relay_state {
     url: [c_char; 256],
     kind: wi_relay_kind,
-    connected: bool,
     last_error: [c_char; 256],
     latency_micros: u64,
 }
@@ -418,18 +436,20 @@ pub unsafe extern "C" fn wi_endpoint_relays(
         };
         for (url, slot) in urls.iter().zip(out.iter_mut()) {
             fill(&mut slot.url, url.as_str());
-            slot.connected = false;
             fill(&mut slot.last_error, "");
             slot.latency_micros = 0;
             slot.kind = match (&home, &report) {
                 (Some(home), _) if home.url() == url => {
-                    slot.connected = home.is_connected();
-                    let error = home
-                        .last_error()
-                        .map(|e| format!("{e:#}"))
-                        .unwrap_or_default();
-                    fill(&mut slot.last_error, &error);
-                    wi_relay_kind::WI_RELAY_HOME
+                    if home.is_connected() {
+                        wi_relay_kind::WI_RELAY_HOME_CONNECTED
+                    } else if let Some(error) = home.last_error() {
+                        fill(&mut slot.last_error, &format!("{error:#}"));
+                        wi_relay_kind::WI_RELAY_HOME_DISCONNECTED
+                    } else {
+                        let errors = this.errors.lock().unwrap_or_else(|e| e.into_inner());
+                        fill(&mut slot.last_error, errors.get(url).map_or("", |e| e));
+                        wi_relay_kind::WI_RELAY_HOME_CONNECTING
+                    }
                 }
                 (_, None) => wi_relay_kind::WI_RELAY_UNPROBED,
                 (_, Some(report)) => match report

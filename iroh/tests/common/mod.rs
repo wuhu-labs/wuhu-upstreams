@@ -3,6 +3,7 @@
 
 use std::{
     ffi::{CStr, CString, c_char, c_void},
+    net::{Shutdown, TcpListener, TcpStream},
     ptr,
     sync::{Mutex, mpsc},
     time::{Duration, Instant},
@@ -37,16 +38,21 @@ pub struct RelayEntry {
     pub auth_token: *const c_char,
 }
 
-pub const HOME: u32 = 0;
-pub const REACHABLE: u32 = 1;
-pub const UNREACHABLE: u32 = 2;
-pub const UNPROBED: u32 = 3;
+pub const HOME_CONNECTED: u32 = 0;
+pub const HOME_CONNECTING: u32 = 1;
+pub const HOME_DISCONNECTED: u32 = 2;
+pub const REACHABLE: u32 = 3;
+pub const UNREACHABLE: u32 = 4;
+pub const UNPROBED: u32 = 5;
+
+pub fn is_home(kind: u32) -> bool {
+    kind <= HOME_DISCONNECTED
+}
 
 #[repr(C)]
 pub struct RelayState {
     pub url: [c_char; 256],
     pub kind: u32,
-    pub connected: bool,
     pub last_error: [c_char; 256],
     pub latency_micros: u64,
 }
@@ -311,7 +317,6 @@ pub fn relays(endpoint: *mut c_void) -> Vec<RelayState> {
         .map(|_| RelayState {
             url: [0; 256],
             kind: 99,
-            connected: false,
             last_error: [0; 256],
             latency_micros: 0,
         })
@@ -325,7 +330,7 @@ pub fn relays(endpoint: *mut c_void) -> Vec<RelayState> {
 pub fn connected_home(endpoint: *mut c_void) -> Option<String> {
     relays(endpoint)
         .into_iter()
-        .find(|state| state.kind == HOME && state.connected)
+        .find(|state| state.kind == HOME_CONNECTED)
         .map(|state| state.url())
 }
 
@@ -448,4 +453,36 @@ pub fn read_to_end(recv: *mut c_void) -> Vec<u8> {
             _ => panic!("{read:?}"),
         }
     }
+}
+
+/// A plain TCP forwarder to `target` that holds each new connection 40 ms before forwarding it, so a
+/// relay behind it probes slower than one reached directly.
+pub fn slow_proxy(target: &CString) -> CString {
+    let target = target
+        .to_str()
+        .unwrap()
+        .trim_start_matches("http://")
+        .to_string();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = CString::new(format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    std::thread::spawn(move || {
+        for client in listener.incoming().flatten() {
+            let target = target.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(40));
+                let Ok(server) = TcpStream::connect(&target) else {
+                    return;
+                };
+                let (mut c, mut s) = (client.try_clone().unwrap(), server.try_clone().unwrap());
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut c, &mut s);
+                    let _ = s.shutdown(Shutdown::Write);
+                });
+                let (mut s, mut c) = (server, client);
+                let _ = std::io::copy(&mut s, &mut c);
+                let _ = c.shutdown(Shutdown::Write);
+            });
+        }
+    });
+    url
 }
