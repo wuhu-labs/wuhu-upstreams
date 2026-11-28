@@ -94,7 +94,15 @@ typedef struct wi_relay_entry {
  * nearest relay that answers its probe home, the old home included when it answers: on localhost a
  * refused home is replaced in about half a second; a relay that drops packets instead holds the
  * report up to its probe timeout (3 s) and its own (5 s), then a dial to the new home follows.
- * With every relay down the home stays and is redialled. With `relay_only` it has no IP transport,
+ * A home relay that answers probes but keeps failing its connection (a refused token, a broken
+ * upgrade) is benched once it failed for 3 s with another relay of the map reachable in the last
+ * report: taken out of iroh's map, which runs one report without it, so another relay is home
+ * within 3 s and that report. A bench lasts 5 s, doubling to 300 s at each bench that follows
+ * before the relay connects as home again; at its end the relay is back in the map (without a
+ * report while the home is connected, so the endpoint stays where it is), and when it fails as
+ * home again it is benched at once. The last relay that is not benched is never benched; when it
+ * fails too, every bench ends. With every relay down the home stays and is redialled. Neither
+ * QUIC address discovery nor port mapping runs: the direct addresses are the bound interfaces'. With `relay_only` it has no IP transport,
  * so every path goes through a relay. `alpn` may be NULL when `alpn_len` is 0. OK: handles[0] is
  * the wi_endpoint. ERROR: message. */
 uint64_t wi_endpoint_bind(const uint8_t secret_key[32], const wi_relay_entry *relays,
@@ -102,8 +110,10 @@ uint64_t wi_endpoint_bind(const uint8_t secret_key[32], const wi_relay_entry *re
                           size_t alpn_len, wi_callback callback, void *context);
 
 /* Replaces the token presented to `relay_url`, a relay of the endpoint's map; NULL for none. The
- * next connection to that relay presents it; a live connection is not touched. OK when the map
- * holds it. ERROR when the URL is not in the map. */
+ * next connection to that relay presents it; a live connection is not touched; a benched relay
+ * keeps it for when its bench ends. Every write of the map (failovers, benches, token changes)
+ * puts the entry as configured now, so no failover undoes a change. OK when the map holds it.
+ * ERROR when the URL is not in the map. CLOSED when the endpoint is closed. */
 uint64_t wi_endpoint_set_auth_token(const wi_endpoint *endpoint, const char *relay_url,
                                     const char *auth_token, wi_callback callback, void *context);
 
@@ -112,7 +122,8 @@ void wi_endpoint_key(const wi_endpoint *endpoint, uint8_t out_public_key[32]);
 /* Dials `public_key` through `relay_url` (any relay, in the map or not; NULL for none) and the
  * `address_count` direct addresses `addresses` ("ip:port", copied before return), at least one of
  * the two. iroh reaches a relay outside the map through a connection of its own, which it closes
- * after 60 s unused; the endpoint does not report it. OK: handles[0] is the wi_connection, bytes
+ * after 60 s unused; the endpoint does not report it. A dial naming a benched relay ends its
+ * bench first, so the dial presents its token; its penalty stays. OK: handles[0] is the wi_connection, bytes
  * the verified 32-byte key. ERROR or CLOSED: message. */
 uint64_t wi_endpoint_connect(const wi_endpoint *endpoint, const uint8_t public_key[32],
                              const char *relay_url, const char *const *addresses,
@@ -140,25 +151,37 @@ typedef enum wi_relay_kind {
   WI_RELAY_UNREACHABLE = 4,
   /* Not connected; no net report has finished yet. */
   WI_RELAY_UNPROBED = 5,
+  /* Benched (see wi_endpoint_bind): out of iroh's map, neither probed nor dialled until its bench
+   * ends; last_error is the failure that benched it. */
+  WI_RELAY_BENCHED = 6,
 } wi_relay_kind;
 
-/* One relay of the map. last_error is set only for WI_RELAY_HOME_CONNECTING and
- * WI_RELAY_HOME_DISCONNECTED, latency_micros only for WI_RELAY_REACHABLE. */
+/* One relay of the map. url is the whole URL in iroh's form (a trailing slash); last_error is NULL
+ * except for WI_RELAY_HOME_CONNECTING (NULL when the relay has not failed), WI_RELAY_HOME_DISCONNECTED
+ * and WI_RELAY_BENCHED; latency_micros is 0 except for WI_RELAY_REACHABLE. The strings belong to
+ * the wi_relays the state came from and live until it is freed. */
 typedef struct wi_relay_state {
-  /* NUL-terminated, truncated to fit. */
-  char url[256];
+  const char *url;
   wi_relay_kind kind;
-  char last_error[256];
+  const char *last_error;
   uint64_t latency_micros;
 } wi_relay_state;
 
-/* Fills up to `capacity` states, one per relay of the map in URL order, and returns how many the
- * map has (a larger number than `capacity` fills only `capacity`). No relay is a home kind until
- * the endpoint has picked its home. */
-size_t wi_endpoint_relays(const wi_endpoint *endpoint, wi_relay_state *out, size_t capacity);
+typedef struct wi_relays wi_relays;
+
+/* The states of the relays of the map, one per configured relay in URL order, as one read saw
+ * them; NULL on failure. No relay is a home kind until the endpoint has picked its home. */
+wi_relays *wi_endpoint_relays(const wi_endpoint *endpoint);
+
+size_t wi_relays_count(const wi_relays *relays);
+
+/* The state at `index` (below wi_relays_count); its strings live as long as `relays`. */
+wi_relay_state wi_relays_get(const wi_relays *relays, size_t index);
+
+void wi_relays_free(wi_relays *relays);
 
 /* The endpoint's direct addresses as peers may dial them: "ip:port" lines, each ending in '\n',
- * of the addresses iroh holds now (bound interfaces and what net reports observed), without
+ * of the addresses iroh holds now (the bound interfaces': no address discovery or port mapping), without
  * loopback, link-local or unspecified IPv4 and without IPv6 outside 2000::/3, sorted. Writes the
  * text and a NUL when it fits in `capacity`; returns its length either way (0: none). */
 size_t wi_endpoint_direct_addresses(const wi_endpoint *endpoint, char *out, size_t capacity);
@@ -192,12 +215,17 @@ typedef struct wi_path {
   /* Through the relay; otherwise a direct UDP path. */
   bool relay;
   uint64_t rtt_micros;
-  /* The relay URL or the remote IP address and port, NUL-terminated, truncated to fit. */
-  char remote[256];
+  /* The whole relay URL or the remote IP address and port; the caller frees it with
+   * wi_string_free. */
+  char *remote;
 } wi_path;
 
-/* The path the connection sends on now; false when it has none or is closed. */
+/* The path the connection sends on now; false (and `out` untouched) when it has none or is
+ * closed. */
 bool wi_connection_path(const wi_connection *connection, wi_path *out);
+
+/* Frees a string the library handed over (wi_path.remote); NULL is a no-op. */
+void wi_string_free(char *text);
 
 /* A cursor over the connection's path events (a path opened, closed or was selected) from now on,
  * for wi_watch_next; NULL on failure. Every cursor sees every event. */

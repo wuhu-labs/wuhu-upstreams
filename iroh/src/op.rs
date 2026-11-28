@@ -261,18 +261,6 @@ pub extern "C" fn wi_cancel(operation: u64) {
     })
 }
 
-/// Copies `text` into a NUL-terminated C buffer of `N` bytes, truncating at a char boundary.
-pub fn fill<const N: usize>(out: &mut [c_char; N], text: &str) {
-    let mut end = text.len().min(N - 1);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    for (slot, byte) in out.iter_mut().zip(text.as_bytes()[..end].iter()) {
-        *slot = *byte as c_char;
-    }
-    out[end] = 0;
-}
-
 pub unsafe fn key(bytes: *const u8) -> [u8; 32] {
     let mut key = [0u8; 32];
     unsafe { ptr::copy_nonoverlapping(bytes, key.as_mut_ptr(), 32) };

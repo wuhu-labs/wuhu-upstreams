@@ -44,30 +44,52 @@ pub const HOME_DISCONNECTED: u32 = 2;
 pub const REACHABLE: u32 = 3;
 pub const UNREACHABLE: u32 = 4;
 pub const UNPROBED: u32 = 5;
+pub const BENCHED: u32 = 6;
 
 pub fn is_home(kind: u32) -> bool {
     kind <= HOME_DISCONNECTED
 }
 
 #[repr(C)]
-pub struct RelayState {
-    pub url: [c_char; 256],
+pub struct RawRelayState {
+    pub url: *const c_char,
     pub kind: u32,
-    pub last_error: [c_char; 256],
+    pub last_error: *const c_char,
+    pub latency_micros: u64,
+}
+
+#[repr(C)]
+pub struct RawPath {
+    pub relay: bool,
+    pub rtt_micros: u64,
+    pub remote: *mut c_char,
+}
+
+fn owned(text: *const c_char) -> Option<String> {
+    (!text.is_null()).then(|| {
+        unsafe { CStr::from_ptr(text) }
+            .to_string_lossy()
+            .into_owned()
+    })
+}
+
+/// One relay of an endpoint's map, copied out of a `wi_relays` snapshot.
+#[derive(Debug, Clone)]
+pub struct RelayState {
+    pub url: String,
+    pub kind: u32,
+    pub last_error: Option<String>,
     pub latency_micros: u64,
 }
 
 impl RelayState {
     pub fn url(&self) -> String {
-        unsafe { CStr::from_ptr(self.url.as_ptr()) }
-            .to_string_lossy()
-            .into_owned()
+        self.url.clone()
     }
 
+    /// The last error, empty when there is none.
     pub fn last_error(&self) -> String {
-        unsafe { CStr::from_ptr(self.last_error.as_ptr()) }
-            .to_string_lossy()
-            .into_owned()
+        self.last_error.clone().unwrap_or_default()
     }
 }
 
@@ -79,11 +101,12 @@ unsafe extern "C" {
         callback: Callback,
         context: *mut c_void,
     ) -> u64;
-    pub fn wi_endpoint_relays(
-        endpoint: *const c_void,
-        out: *mut RelayState,
-        capacity: usize,
-    ) -> usize;
+    pub fn wi_endpoint_relays(endpoint: *const c_void) -> *mut c_void;
+    pub fn wi_relays_count(relays: *const c_void) -> usize;
+    pub fn wi_relays_get(relays: *const c_void, index: usize) -> RawRelayState;
+    pub fn wi_relays_free(relays: *mut c_void);
+    pub fn wi_connection_path(connection: *const c_void, out: *mut RawPath) -> bool;
+    pub fn wi_string_free(text: *mut c_char);
     pub fn wi_endpoint_direct_addresses(
         endpoint: *const c_void,
         out: *mut c_char,
@@ -111,6 +134,7 @@ unsafe extern "C" {
         context: *mut c_void,
     ) -> u64;
     pub fn wi_endpoint_key(endpoint: *const c_void, out: *mut u8);
+    pub fn wi_secret_key_public(secret: *const u8, out: *mut u8);
     pub fn wi_endpoint_connect(
         endpoint: *const c_void,
         key: *const u8,
@@ -312,18 +336,33 @@ pub fn dial(endpoint: *mut c_void, key: &[u8; 32], url: &CString) -> mpsc::Recei
 
 /// The endpoint's relay states, in URL order.
 pub fn relays(endpoint: *mut c_void) -> Vec<RelayState> {
-    let count = unsafe { wi_endpoint_relays(endpoint, ptr::null_mut(), 0) };
-    let mut states: Vec<RelayState> = (0..count)
-        .map(|_| RelayState {
-            url: [0; 256],
-            kind: 99,
-            last_error: [0; 256],
-            latency_micros: 0,
+    let snapshot = unsafe { wi_endpoint_relays(endpoint) };
+    assert!(!snapshot.is_null());
+    let states = (0..unsafe { wi_relays_count(snapshot) })
+        .map(|index| {
+            let raw = unsafe { wi_relays_get(snapshot, index) };
+            RelayState {
+                url: owned(raw.url).expect("a URL"),
+                kind: raw.kind,
+                last_error: owned(raw.last_error),
+                latency_micros: raw.latency_micros,
+            }
         })
         .collect();
-    let filled = unsafe { wi_endpoint_relays(endpoint, states.as_mut_ptr(), states.len()) };
-    assert_eq!(filled, count);
+    unsafe { wi_relays_free(snapshot) };
     states
+}
+
+/// The path a connection sends on now: whether it is a relay path, and its remote.
+pub fn path(connection: *mut c_void) -> Option<(bool, String)> {
+    let mut out = std::mem::MaybeUninit::<RawPath>::uninit();
+    if !unsafe { wi_connection_path(connection, out.as_mut_ptr()) } {
+        return None;
+    }
+    let out = unsafe { out.assume_init() };
+    let remote = owned(out.remote).expect("a remote");
+    unsafe { wi_string_free(out.remote) };
+    Some((out.relay, remote))
 }
 
 /// The URL of the endpoint's home relay once it is connected there.

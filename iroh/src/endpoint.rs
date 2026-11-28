@@ -1,47 +1,34 @@
 //! Endpoints and connections.
 
 use std::{
-    collections::HashMap,
-    ffi::{c_char, c_void},
+    ffi::{CString, c_char, c_void},
     net::{IpAddr, SocketAddr},
     ptr,
-    sync::{
-        Arc, Mutex, Weak,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, Weak},
 };
 
 use futures_util::StreamExt;
 use iroh::{
     Endpoint, EndpointAddr, PublicKey, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
     Watcher,
-    endpoint::{Connection, ConnectionError, VarInt, presets},
+    endpoint::{Connection, ConnectionError, PortmapperConfig, VarInt, presets},
 };
-use tokio::{
-    task::AbortHandle,
-    time::{Instant, sleep_until},
-};
+use tokio::task::AbortHandle;
 
-use crate::op::{Outcome, RunOnce, fill, guard, handle, key, spawn, text, wi_callback};
-use crate::pacing::Pacing;
+use crate::book::{Relays, TokenError};
+use crate::op::{Outcome, RunOnce, guard, handle, key, spawn, text, wi_callback};
 use crate::stream::{RecvHandle, SendHandle};
 use crate::watch::wi_watch;
 
 #[allow(non_camel_case_types)]
 pub struct wi_endpoint {
     endpoint: Endpoint,
-    relays: RelayMap,
+    relays: Arc<Relays>,
     alpn: Vec<u8>,
     close: RunOnce<()>,
     connections: Arc<Mutex<Connections>>,
     failover: AbortHandle,
-    failovers: Arc<AtomicU64>,
-    errors: Arc<Mutex<LastErrors>>,
 }
-
-/// Each relay's last connection error, as the failover task saw it: iroh drops it once a redial
-/// starts, while a redial is still the relay that failed.
-type LastErrors = HashMap<RelayUrl, String>;
 
 impl Drop for wi_endpoint {
     fn drop(&mut self) {
@@ -123,59 +110,6 @@ fn relay_config(url: RelayUrl, auth_token: Option<String>) -> Arc<RelayConfig> {
     Arc::new(config)
 }
 
-/// iroh moves its home relay only after a net report, which runs every 20 to 26 s; a relay map
-/// change runs one at once, so a failure of the home relay's connection re-inserts its entry, as
-/// often as `Pacing` allows. It also keeps each relay's last error in `errors`.
-async fn fail_over(
-    endpoint: Endpoint,
-    relays: RelayMap,
-    failovers: Arc<AtomicU64>,
-    errors: Arc<Mutex<LastErrors>>,
-) {
-    let closing = endpoint.clone();
-    let mut statuses = endpoint
-        .home_relay_status()
-        .stream_updates_only()
-        .take_until(async move { closing.closed().await })
-        .boxed();
-    let mut pacing = Pacing::new(Instant::now());
-    let mut failed: Option<RelayUrl> = None;
-    loop {
-        tokio::select! {
-            next = statuses.next() => {
-                let Some(statuses) = next else {
-                    return;
-                };
-                let Some(home) = statuses.first() else {
-                    continue;
-                };
-                let mut last_errors = errors.lock().unwrap_or_else(|e| e.into_inner());
-                if home.is_connected() {
-                    last_errors.remove(home.url());
-                    pacing.connected(Instant::now());
-                    failed = None;
-                } else if let Some(error) = home.last_error() {
-                    last_errors.insert(home.url().clone(), format!("{error:#}"));
-                    failed = Some(home.url().clone());
-                }
-            }
-            () = sleep_until(pacing.ready_at), if failed.is_some() => {}
-        }
-        let now = Instant::now();
-        if now < pacing.ready_at {
-            continue;
-        }
-        let Some(url) = failed.take() else {
-            continue;
-        };
-        pacing.fired(now);
-        failovers.fetch_add(1, Ordering::Relaxed);
-        if let Some(config) = relays.get(&url) {
-            endpoint.insert_relay(url, config).await;
-        }
-    }
-}
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wi_endpoint_bind(
     secret_key: *const u8,
@@ -214,24 +148,20 @@ pub unsafe extern "C" fn wi_endpoint_bind(
         if relays.is_empty() {
             return Outcome::Error("no relay".into());
         }
+        // Direct addresses are the bound interfaces' only: with every relay's QUIC address
+        // discovery off (`relay_config`), no port mapping either.
         let mut builder = Endpoint::builder(presets::Minimal)
             .secret_key(secret)
             .alpns(vec![alpn.clone()])
-            .relay_mode(RelayMode::Custom(relays.clone()));
+            .relay_mode(RelayMode::Custom(relays.clone()))
+            .portmapper_config(PortmapperConfig::Disabled);
         if relay_only {
             builder = builder.clear_ip_transports();
         }
         match builder.bind().await {
             Ok(endpoint) => {
-                let failovers = Arc::new(AtomicU64::new(0));
-                let errors = Arc::new(Mutex::new(LastErrors::new()));
-                let failover = tokio::spawn(fail_over(
-                    endpoint.clone(),
-                    relays.clone(),
-                    failovers.clone(),
-                    errors.clone(),
-                ))
-                .abort_handle();
+                let relays = Relays::new(endpoint.clone(), relays);
+                let failover = tokio::spawn(relays.clone().run()).abort_handle();
                 Outcome::Handle(handle(wi_endpoint {
                     endpoint,
                     relays,
@@ -239,8 +169,6 @@ pub unsafe extern "C" fn wi_endpoint_bind(
                     close: RunOnce::new(),
                     connections: Default::default(),
                     failover,
-                    failovers,
-                    errors,
                 }))
             }
             Err(e) => Outcome::error(e),
@@ -256,9 +184,7 @@ pub unsafe extern "C" fn wi_endpoint_set_auth_token(
     callback: wi_callback,
     context: *mut c_void,
 ) -> u64 {
-    let this = unsafe { &*endpoint };
-    let endpoint = this.endpoint.clone();
-    let relays = this.relays.clone();
+    let relays = unsafe { &*endpoint }.relays.clone();
     let relay = relay_url(unsafe { text(relay_url_text) });
     let auth_token = unsafe { text(auth_token) };
     spawn(callback, context, async move {
@@ -266,13 +192,14 @@ pub unsafe extern "C" fn wi_endpoint_set_auth_token(
             Ok(relay) => relay,
             Err(e) => return Outcome::Error(e),
         };
-        if !relays.contains(&relay) {
-            return Outcome::Error(format!("relay URL {relay} is not in the endpoint's map"));
+        let config = relay_config(relay.clone(), auth_token);
+        match relays.set_auth_token(&relay, config).await {
+            Ok(()) => Outcome::Ok,
+            Err(TokenError::NotInMap) => {
+                Outcome::Error(format!("relay URL {relay} is not in the endpoint's map"))
+            }
+            Err(TokenError::Closed) => Outcome::Closed("endpoint closed".into()),
         }
-        endpoint
-            .insert_relay(relay.clone(), relay_config(relay, auth_token))
-            .await;
-        Outcome::Ok
     })
 }
 
@@ -308,6 +235,7 @@ pub unsafe extern "C" fn wi_endpoint_connect(
     let endpoint = this.endpoint.clone();
     let alpn = this.alpn.clone();
     let connections = this.connections.clone();
+    let relays = this.relays.clone();
     let peer = PublicKey::from_bytes(&unsafe { key(public_key) });
     let relay = unsafe { text(relay_url_text) }.map(|url| relay_url(Some(url)));
     let addresses: Vec<_> = if address_count == 0 {
@@ -325,7 +253,10 @@ pub unsafe extern "C" fn wi_endpoint_connect(
         };
         let mut address = EndpointAddr::new(peer);
         match relay {
-            Some(Ok(relay)) => address = address.with_relay_url(relay),
+            Some(Ok(relay)) => {
+                relays.dialling(&relay).await;
+                address = address.with_relay_url(relay);
+            }
             Some(Err(e)) => return Outcome::Error(e),
             None => {}
         }
@@ -407,68 +338,127 @@ pub enum wi_relay_kind {
     WI_RELAY_REACHABLE = 3,
     WI_RELAY_UNREACHABLE = 4,
     WI_RELAY_UNPROBED = 5,
+    WI_RELAY_BENCHED = 6,
 }
 
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct wi_relay_state {
-    url: [c_char; 256],
+    url: *const c_char,
     kind: wi_relay_kind,
-    last_error: [c_char; 256],
+    last_error: *const c_char,
     latency_micros: u64,
 }
 
+struct RelayState {
+    url: CString,
+    kind: wi_relay_kind,
+    last_error: Option<CString>,
+    latency_micros: u64,
+}
+
+/// The endpoint's relays as one read saw them; its strings live as long as it does.
+#[allow(non_camel_case_types)]
+pub struct wi_relays(Vec<RelayState>);
+
+fn c_string(text: &str) -> CString {
+    CString::new(text.replace('\0', " ")).expect("no NUL")
+}
+
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wi_endpoint_relays(
-    endpoint: *const wi_endpoint,
-    out: *mut wi_relay_state,
-    capacity: usize,
-) -> usize {
+pub unsafe extern "C" fn wi_endpoint_relays(endpoint: *const wi_endpoint) -> *mut wi_relays {
     let this = unsafe { &*endpoint };
-    guard(0, || {
-        let urls: Vec<RelayUrl> = this.relays.urls();
+    guard(ptr::null_mut(), || {
         let home = this.endpoint.home_relay_status().get().into_iter().next();
         let report = this.endpoint.net_report().get();
-        let out = if capacity == 0 {
-            &mut [][..]
-        } else {
-            unsafe { std::slice::from_raw_parts_mut(out, capacity) }
-        };
-        for (url, slot) in urls.iter().zip(out.iter_mut()) {
-            fill(&mut slot.url, url.as_str());
-            fill(&mut slot.last_error, "");
-            slot.latency_micros = 0;
-            slot.kind = match (&home, &report) {
-                (Some(home), _) if home.url() == url => {
-                    if home.is_connected() {
-                        wi_relay_kind::WI_RELAY_HOME_CONNECTED
-                    } else if let Some(error) = home.last_error() {
-                        fill(&mut slot.last_error, &format!("{error:#}"));
-                        wi_relay_kind::WI_RELAY_HOME_DISCONNECTED
-                    } else {
-                        let errors = this.errors.lock().unwrap_or_else(|e| e.into_inner());
-                        fill(&mut slot.last_error, errors.get(url).map_or("", |e| e));
-                        wi_relay_kind::WI_RELAY_HOME_CONNECTING
+        let states = this
+            .relays
+            .entries()
+            .into_iter()
+            .map(|entry| {
+                let url = &entry.url;
+                let mut last_error = None;
+                let mut latency_micros = 0;
+                let kind = match (&home, &report) {
+                    (_, _) if entry.benched => {
+                        last_error = entry.last_error.clone();
+                        wi_relay_kind::WI_RELAY_BENCHED
                     }
+                    (Some(home), _) if home.url() == url => {
+                        if home.is_connected() {
+                            wi_relay_kind::WI_RELAY_HOME_CONNECTED
+                        } else if let Some(error) = home.last_error() {
+                            last_error = Some(format!("{error:#}"));
+                            wi_relay_kind::WI_RELAY_HOME_DISCONNECTED
+                        } else {
+                            last_error = this.relays.last_error(url);
+                            wi_relay_kind::WI_RELAY_HOME_CONNECTING
+                        }
+                    }
+                    (_, None) => wi_relay_kind::WI_RELAY_UNPROBED,
+                    (_, Some(report)) => match report
+                        .relay_latency
+                        .iter()
+                        .filter(|(_, probed, _)| *probed == url)
+                        .map(|(_, _, latency)| latency)
+                        .min()
+                    {
+                        Some(latency) => {
+                            latency_micros = (latency.as_micros() as u64).max(1);
+                            wi_relay_kind::WI_RELAY_REACHABLE
+                        }
+                        None => wi_relay_kind::WI_RELAY_UNREACHABLE,
+                    },
+                };
+                RelayState {
+                    url: c_string(url.as_str()),
+                    kind,
+                    last_error: last_error.as_deref().map(c_string),
+                    latency_micros,
                 }
-                (_, None) => wi_relay_kind::WI_RELAY_UNPROBED,
-                (_, Some(report)) => match report
-                    .relay_latency
-                    .iter()
-                    .filter(|(_, probed, _)| *probed == url)
-                    .map(|(_, _, latency)| latency)
-                    .min()
-                {
-                    Some(latency) => {
-                        slot.latency_micros = (latency.as_micros() as u64).max(1);
-                        wi_relay_kind::WI_RELAY_REACHABLE
-                    }
-                    None => wi_relay_kind::WI_RELAY_UNREACHABLE,
-                },
-            };
-        }
-        urls.len()
+            })
+            .collect();
+        handle(wi_relays(states)) as *mut wi_relays
     })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wi_relays_count(relays: *const wi_relays) -> usize {
+    let relays = unsafe { &*relays };
+    guard(0, || relays.0.len())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wi_relays_get(relays: *const wi_relays, index: usize) -> wi_relay_state {
+    let relays = unsafe { &*relays };
+    let missing = wi_relay_state {
+        url: ptr::null(),
+        kind: wi_relay_kind::WI_RELAY_UNPROBED,
+        last_error: ptr::null(),
+        latency_micros: 0,
+    };
+    guard(missing, || match relays.0.get(index) {
+        Some(state) => wi_relay_state {
+            url: state.url.as_ptr(),
+            kind: state.kind,
+            last_error: state
+                .last_error
+                .as_ref()
+                .map_or(ptr::null(), |e| e.as_ptr()),
+            latency_micros: state.latency_micros,
+        },
+        None => wi_relay_state {
+            url: ptr::null(),
+            kind: wi_relay_kind::WI_RELAY_UNPROBED,
+            last_error: ptr::null(),
+            latency_micros: 0,
+        },
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wi_relays_free(relays: *mut wi_relays) {
+    guard((), || drop(unsafe { Box::from_raw(relays) }))
 }
 
 fn advertised(address: &SocketAddr) -> bool {
@@ -612,7 +602,7 @@ pub unsafe extern "C" fn wi_connection_accept(
 pub struct wi_path {
     relay: bool,
     rtt_micros: u64,
-    remote: [c_char; 256],
+    remote: *mut c_char,
 }
 
 #[unsafe(no_mangle)]
@@ -621,7 +611,6 @@ pub unsafe extern "C" fn wi_connection_path(
     out: *mut wi_path,
 ) -> bool {
     let connection = unsafe { &*connection };
-    let out = unsafe { &mut *out };
     guard(false, || {
         let paths = connection.0.connection.paths();
         let Some(path) = paths
@@ -631,16 +620,27 @@ pub unsafe extern "C" fn wi_connection_path(
         else {
             return false;
         };
-        out.relay = path.is_relay();
-        out.rtt_micros = path.rtt().as_micros() as u64;
         let remote = match path.remote_addr() {
             iroh::TransportAddr::Relay(url) => url.to_string(),
             iroh::TransportAddr::Ip(address) => address.to_string(),
             other => format!("{other:?}"),
         };
-        fill(&mut out.remote, &remote);
+        let value = wi_path {
+            relay: path.is_relay(),
+            rtt_micros: path.rtt().as_micros() as u64,
+            remote: c_string(&remote).into_raw(),
+        };
+        unsafe { out.write(value) };
         true
     })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wi_string_free(text: *mut c_char) {
+    if text.is_null() {
+        return;
+    }
+    guard((), || drop(unsafe { CString::from_raw(text) }))
 }
 
 #[unsafe(no_mangle)]
@@ -699,5 +699,11 @@ pub unsafe fn net_reports(endpoint: *const c_void) -> u64 {
 #[doc(hidden)]
 pub unsafe fn failovers(endpoint: *const c_void) -> u64 {
     let this = unsafe { &*(endpoint as *const wi_endpoint) };
-    this.failovers.load(Ordering::Relaxed)
+    this.relays.failovers()
+}
+
+#[doc(hidden)]
+pub unsafe fn failover_gate(endpoint: *const c_void) -> Arc<tokio::sync::Mutex<()>> {
+    let this = unsafe { &*(endpoint as *const wi_endpoint) };
+    this.relays.gate()
 }
