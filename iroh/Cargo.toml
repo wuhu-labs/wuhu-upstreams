@@ -27,9 +27,9 @@ strip = "debuginfo"
 
 # Each patched crate comes from a fork at an exact commit; PROVENANCE.md says what each patch changes.
 [patch.crates-io]
-iroh = { git = "https://github.com/wuhu-labs/iroh", rev = "327dc811f2331e1b63084794bd2ac2757503a638" }
-iroh-base = { git = "https://github.com/wuhu-labs/iroh", rev = "327dc811f2331e1b63084794bd2ac2757503a638" }
-iroh-relay = { git = "https://github.com/wuhu-labs/iroh", rev = "327dc811f2331e1b63084794bd2ac2757503a638" }
+iroh = { git = "https://github.com/wuhu-labs/iroh", rev = "54cef96d921e918c57eb0257d093a37356cf98cc" }
+iroh-base = { git = "https://github.com/wuhu-labs/iroh", rev = "54cef96d921e918c57eb0257d093a37356cf98cc" }
+iroh-relay = { git = "https://github.com/wuhu-labs/iroh", rev = "54cef96d921e918c57eb0257d093a37356cf98cc" }
 noq = { git = "https://github.com/wuhu-labs/noq", rev = "08630983dfc63b40101b8c50544f11fde23ee1fd" }
 noq-proto = { git = "https://github.com/wuhu-labs/noq", rev = "08630983dfc63b40101b8c50544f11fde23ee1fd" }
 noq-udp = { git = "https://github.com/wuhu-labs/noq", rev = "08630983dfc63b40101b8c50544f11fde23ee1fd" }
