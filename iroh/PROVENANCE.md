@@ -11,7 +11,7 @@ Static archives of `wuhu_iroh`, Wuhu's C ABI over [iroh](https://github.com/n0-c
 
 ## The ABI
 
-`include/wuhu_iroh.h` is the whole contract: endpoints made from an Ed25519 secret key and one relay URL (relay only, or relay plus direct UDP; no discovery service), connections whose accept hands over the verified caller key, bidirectional streams with QUIC backpressure, path and relay state, `network_change`, and an embedded relay with caller admission (`on_connect`, `on_disconnect`) and `disconnect(key)`. Asynchronous calls complete through a callback, exactly once, and can be cancelled.
+`include/wuhu_iroh.h` is the whole contract: endpoints made from an Ed25519 secret key and a relay map, each relay with its own auth token (relay only, or relays plus direct UDP; no discovery service), home relay failover, per-relay state and direct addresses, dials by relay URL and direct addresses, connections whose accept hands over the verified caller key, bidirectional streams with QUIC backpressure, path and relay state, `network_change`, and an embedded relay with caller admission (`on_connect` with the client's bearer token, `on_disconnect`) and `disconnect(key)`. Asynchronous calls complete through a callback, exactly once, and can be cancelled.
 
 ## Artifacts
 

@@ -25,12 +25,64 @@ pub type Callback = unsafe extern "C" fn(*mut c_void, *const WiResult);
 #[repr(C)]
 pub struct Access {
     pub context: *mut c_void,
-    pub on_connect: Option<unsafe extern "C" fn(*mut c_void, *const u8, u64) -> bool>,
+    pub on_connect:
+        Option<unsafe extern "C" fn(*mut c_void, *const u8, u64, *const c_char) -> bool>,
     pub on_disconnect: Option<unsafe extern "C" fn(*mut c_void, *const u8, u64)>,
     pub release: Option<unsafe extern "C" fn(*mut c_void)>,
 }
 
+#[repr(C)]
+pub struct RelayEntry {
+    pub url: *const c_char,
+    pub auth_token: *const c_char,
+}
+
+pub const HOME: u32 = 0;
+pub const REACHABLE: u32 = 1;
+pub const UNREACHABLE: u32 = 2;
+pub const UNPROBED: u32 = 3;
+
+#[repr(C)]
+pub struct RelayState {
+    pub url: [c_char; 256],
+    pub kind: u32,
+    pub connected: bool,
+    pub last_error: [c_char; 256],
+    pub latency_micros: u64,
+}
+
+impl RelayState {
+    pub fn url(&self) -> String {
+        unsafe { CStr::from_ptr(self.url.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    pub fn last_error(&self) -> String {
+        unsafe { CStr::from_ptr(self.last_error.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
 unsafe extern "C" {
+    pub fn wi_endpoint_set_auth_token(
+        endpoint: *const c_void,
+        relay_url: *const c_char,
+        auth_token: *const c_char,
+        callback: Callback,
+        context: *mut c_void,
+    ) -> u64;
+    pub fn wi_endpoint_relays(
+        endpoint: *const c_void,
+        out: *mut RelayState,
+        capacity: usize,
+    ) -> usize;
+    pub fn wi_endpoint_direct_addresses(
+        endpoint: *const c_void,
+        out: *mut c_char,
+        capacity: usize,
+    ) -> usize;
     pub fn wi_relay_spawn(
         address: *const c_char,
         cert: *const c_char,
@@ -44,7 +96,8 @@ unsafe extern "C" {
     pub fn wi_relay_free(relay: *mut c_void);
     pub fn wi_endpoint_bind(
         secret: *const u8,
-        relay: *const c_char,
+        relays: *const RelayEntry,
+        relay_count: usize,
         relay_only: bool,
         alpn: *const u8,
         alpn_len: usize,
@@ -55,19 +108,28 @@ unsafe extern "C" {
     pub fn wi_endpoint_connect(
         endpoint: *const c_void,
         key: *const u8,
+        relay_url: *const c_char,
+        addresses: *const *const c_char,
+        address_count: usize,
         callback: Callback,
         context: *mut c_void,
     ) -> u64;
-    pub fn wi_endpoint_relay_watch(endpoint: *const c_void) -> *mut c_void;
+    pub fn wi_endpoint_watch(endpoint: *const c_void) -> *mut c_void;
     pub fn wi_watch_next(watch: *const c_void, callback: Callback, context: *mut c_void) -> u64;
     pub fn wi_watch_free(watch: *mut c_void);
     pub fn wi_send_stopped(send: *const c_void, callback: Callback, context: *mut c_void) -> u64;
     pub fn wi_recv_stop(recv: *const c_void, code: u64);
-    pub fn wi_endpoint_accept(endpoint: *const c_void, callback: Callback, context: *mut c_void)
-    -> u64;
+    pub fn wi_endpoint_accept(
+        endpoint: *const c_void,
+        callback: Callback,
+        context: *mut c_void,
+    ) -> u64;
     pub fn wi_endpoint_free(endpoint: *mut c_void);
-    pub fn wi_connection_open(connection: *const c_void, callback: Callback, context: *mut c_void)
-    -> u64;
+    pub fn wi_connection_open(
+        connection: *const c_void,
+        callback: Callback,
+        context: *mut c_void,
+    ) -> u64;
     pub fn wi_connection_accept(
         connection: *const c_void,
         callback: Callback,
@@ -90,11 +152,20 @@ unsafe extern "C" {
     pub fn wi_send_finish(send: *const c_void) -> i32;
     pub fn wi_send_reset(send: *const c_void, code: u64);
     pub fn wi_send_free(send: *mut c_void);
-    pub fn wi_recv_read(recv: *const c_void, max: usize, callback: Callback, context: *mut c_void)
-    -> u64;
+    pub fn wi_recv_read(
+        recv: *const c_void,
+        max: usize,
+        callback: Callback,
+        context: *mut c_void,
+    ) -> u64;
     pub fn wi_recv_free(recv: *mut c_void);
-    pub fn wi_endpoint_close(endpoint: *const c_void, callback: Callback, context: *mut c_void) -> u64;
-    pub fn wi_relay_shutdown(relay: *const c_void, callback: Callback, context: *mut c_void) -> u64;
+    pub fn wi_endpoint_close(
+        endpoint: *const c_void,
+        callback: Callback,
+        context: *mut c_void,
+    ) -> u64;
+    pub fn wi_relay_shutdown(relay: *const c_void, callback: Callback, context: *mut c_void)
+    -> u64;
     pub fn wi_cancel(operation: u64);
 }
 
@@ -118,7 +189,9 @@ pub unsafe extern "C" fn reply(context: *mut c_void, result: *const WiResult) {
     let message = if result.message.is_null() {
         String::new()
     } else {
-        unsafe { CStr::from_ptr(result.message) }.to_string_lossy().into_owned()
+        unsafe { CStr::from_ptr(result.message) }
+            .to_string_lossy()
+            .into_owned()
     };
     let _ = sender.send(Done {
         status: result.status,
@@ -136,7 +209,9 @@ pub fn call(start: impl FnOnce(Callback, *mut c_void) -> u64) -> mpsc::Receiver<
 }
 
 pub fn wait(receiver: mpsc::Receiver<Done>) -> Done {
-    receiver.recv_timeout(Duration::from_secs(10)).expect("callback within 10 s")
+    receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("callback within 10 s")
 }
 
 pub fn ok(receiver: mpsc::Receiver<Done>) -> Done {
@@ -147,7 +222,7 @@ pub fn ok(receiver: mpsc::Receiver<Done>) -> Done {
 
 pub const DENIED: [u8; 32] = [9; 32];
 
-pub unsafe extern "C" fn admit(_: *mut c_void, _key: *const u8, _: u64) -> bool {
+pub unsafe extern "C" fn admit(_: *mut c_void, _key: *const u8, _: u64, _: *const c_char) -> bool {
     true
 }
 
@@ -163,7 +238,7 @@ pub fn spawn_relay() -> (*mut c_void, CString) {
 }
 
 pub fn spawn_relay_with(
-    on_connect: unsafe extern "C" fn(*mut c_void, *const u8, u64) -> bool,
+    on_connect: unsafe extern "C" fn(*mut c_void, *const u8, u64, *const c_char) -> bool,
     on_disconnect: unsafe extern "C" fn(*mut c_void, *const u8, u64),
 ) -> (*mut c_void, CString) {
     spawn_relay_access(Access {
@@ -185,30 +260,92 @@ pub fn spawn_relay_access(access: Access) -> (*mut c_void, CString) {
     assert!(len > 0);
     let url = format!(
         "http://{}",
-        unsafe { CStr::from_ptr(address.as_ptr()) }.to_str().unwrap()
+        unsafe { CStr::from_ptr(address.as_ptr()) }
+            .to_str()
+            .unwrap()
     );
     (relay, CString::new(url).unwrap())
 }
 
 pub fn bind(seed: u8, url: &CString) -> *mut c_void {
+    bind_to(seed, &[(url, None)])
+}
+
+/// A relay-only endpoint over `relays`, each with its token or none.
+pub fn bind_to(seed: u8, relays: &[(&CString, Option<&CString>)]) -> *mut c_void {
     let secret = [seed; 32];
     let alpn = b"wuhu/test/0";
+    let entries: Vec<RelayEntry> = relays
+        .iter()
+        .map(|(url, token)| RelayEntry {
+            url: url.as_ptr(),
+            auth_token: token.map_or(ptr::null(), |token| token.as_ptr()),
+        })
+        .collect();
     ok(call(|cb, cx| unsafe {
-        wi_endpoint_bind(secret.as_ptr(), url.as_ptr(), true, alpn.as_ptr(), alpn.len(), cb, cx)
+        wi_endpoint_bind(
+            secret.as_ptr(),
+            entries.as_ptr(),
+            entries.len(),
+            true,
+            alpn.as_ptr(),
+            alpn.len(),
+            cb,
+            cx,
+        )
     }))
     .handles[0] as *mut c_void
+}
+
+/// Dials `key` through `url`.
+pub fn dial(endpoint: *mut c_void, key: &[u8; 32], url: &CString) -> mpsc::Receiver<Done> {
+    call(|cb, cx| unsafe {
+        wi_endpoint_connect(endpoint, key.as_ptr(), url.as_ptr(), ptr::null(), 0, cb, cx)
+    })
+}
+
+/// The endpoint's relay states, in URL order.
+pub fn relays(endpoint: *mut c_void) -> Vec<RelayState> {
+    let count = unsafe { wi_endpoint_relays(endpoint, ptr::null_mut(), 0) };
+    let mut states: Vec<RelayState> = (0..count)
+        .map(|_| RelayState {
+            url: [0; 256],
+            kind: 99,
+            connected: false,
+            last_error: [0; 256],
+            latency_micros: 0,
+        })
+        .collect();
+    let filled = unsafe { wi_endpoint_relays(endpoint, states.as_mut_ptr(), states.len()) };
+    assert_eq!(filled, count);
+    states
+}
+
+/// The URL of the endpoint's home relay once it is connected there.
+pub fn connected_home(endpoint: *mut c_void) -> Option<String> {
+    relays(endpoint)
+        .into_iter()
+        .find(|state| state.kind == HOME && state.connected)
+        .map(|state| state.url())
 }
 
 pub static SHUT_OUT: Mutex<Vec<[u8; 32]>> = Mutex::new(Vec::new());
 pub static GONE: Mutex<Vec<[u8; 32]>> = Mutex::new(Vec::new());
 
-pub unsafe extern "C" fn admit_unless_shut_out(_: *mut c_void, key: *const u8, _: u64) -> bool {
+pub unsafe extern "C" fn admit_unless_shut_out(
+    _: *mut c_void,
+    key: *const u8,
+    _: u64,
+    _: *const c_char,
+) -> bool {
     let key = unsafe { *(key as *const [u8; 32]) };
     !SHUT_OUT.lock().unwrap().contains(&key)
 }
 
 pub unsafe extern "C" fn record_gone(_: *mut c_void, key: *const u8, _: u64) {
-    GONE.lock().unwrap().push(unsafe { *(key as *const [u8; 32]) });
+    GONE.lock()
+        .unwrap()
+        .push(unsafe { *(key as *const [u8; 32]) });
 }
 
 /// Polls every 10 ms, for at most `limit`.
@@ -223,20 +360,18 @@ pub fn eventually(limit: Duration, condition: impl Fn() -> bool) -> bool {
     condition()
 }
 
-fn connect([server, client]: [*mut c_void; 2]) -> [*mut c_void; 2] {
+fn connect([server, client]: [*mut c_void; 2], url: &CString) -> [*mut c_void; 2] {
     let mut server_key = [0u8; 32];
     unsafe { wi_endpoint_key(server, server_key.as_mut_ptr()) };
     let accepted = call(|cb, cx| unsafe { wi_endpoint_accept(server, cb, cx) });
-    let outgoing = ok(call(|cb, cx| unsafe {
-        wi_endpoint_connect(client, server_key.as_ptr(), cb, cx)
-    }))
-    .handles[0] as *mut c_void;
+    let outgoing = ok(dial(client, &server_key, url)).handles[0] as *mut c_void;
     [outgoing, ok(accepted).handles[0] as *mut c_void]
 }
 
 /// Two endpoints on one open relay, the client's connection to the server and the server's side.
 pub struct Link {
     pub relay: *mut c_void,
+    pub url: CString,
     pub endpoints: [*mut c_void; 2],
     pub outgoing: *mut c_void,
     pub incoming: *mut c_void,
@@ -247,9 +382,10 @@ impl Link {
         let (relay, url) = spawn_relay();
         let server = bind(seeds[0], &url);
         let client = bind(seeds[1], &url);
-        let [outgoing, incoming] = connect([server, client]);
+        let [outgoing, incoming] = connect([server, client], &url);
         Link {
             relay,
+            url,
             endpoints: [server, client],
             outgoing,
             incoming,
@@ -258,16 +394,31 @@ impl Link {
 
     /// Another connection from the client, and the server's side of it.
     pub fn connect(&self) -> [*mut c_void; 2] {
-        connect(self.endpoints)
+        connect(self.endpoints, &self.url)
     }
 
     /// A stream from the client, and the server's side of it once `first` reached it.
     pub fn stream(&self, first: &[u8]) -> ([*mut c_void; 2], [*mut c_void; 2]) {
-        let opened = ok(call(|cb, cx| unsafe { wi_connection_open(self.outgoing, cb, cx) }));
-        let ours = [opened.handles[0] as *mut c_void, opened.handles[1] as *mut c_void];
-        ok(call(|cb, cx| unsafe { wi_send_write(ours[0], first.as_ptr(), first.len(), cb, cx) }));
-        let accepted = ok(call(|cb, cx| unsafe { wi_connection_accept(self.incoming, cb, cx) }));
-        (ours, [accepted.handles[0] as *mut c_void, accepted.handles[1] as *mut c_void])
+        let opened = ok(call(|cb, cx| unsafe {
+            wi_connection_open(self.outgoing, cb, cx)
+        }));
+        let ours = [
+            opened.handles[0] as *mut c_void,
+            opened.handles[1] as *mut c_void,
+        ];
+        ok(call(|cb, cx| unsafe {
+            wi_send_write(ours[0], first.as_ptr(), first.len(), cb, cx)
+        }));
+        let accepted = ok(call(|cb, cx| unsafe {
+            wi_connection_accept(self.incoming, cb, cx)
+        }));
+        (
+            ours,
+            [
+                accepted.handles[0] as *mut c_void,
+                accepted.handles[1] as *mut c_void,
+            ],
+        )
     }
 }
 
@@ -288,7 +439,9 @@ impl Drop for Link {
 pub fn read_to_end(recv: *mut c_void) -> Vec<u8> {
     let mut bytes = Vec::new();
     loop {
-        let read = wait(call(|cb, cx| unsafe { wi_recv_read(recv, 1 << 20, cb, cx) }));
+        let read = wait(call(|cb, cx| unsafe {
+            wi_recv_read(recv, 1 << 20, cb, cx)
+        }));
         match read.status {
             0 => bytes.extend(read.bytes),
             1 => return bytes,
@@ -296,4 +449,3 @@ pub fn read_to_end(recv: *mut c_void) -> Vec<u8> {
         }
     }
 }
-

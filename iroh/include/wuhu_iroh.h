@@ -75,21 +75,45 @@ void wi_secret_key_public(const uint8_t secret_key[32], uint8_t out_public_key[3
 
 /* ---- Endpoint ---------------------------------------------------------------------------- */
 
-/* Binds an endpoint for `secret_key` whose only relay is `relay_url`, accepting and dialling the
- * ALPN `alpn`. No discovery service is used: a peer is addressed by (relay URL, key). With
- * `relay_only` it has no IP transport, so every path goes through the relay. `alpn` may be NULL
- * when `alpn_len` is 0. OK: handles[0] is the wi_endpoint. ERROR: message. */
-uint64_t wi_endpoint_bind(const uint8_t secret_key[32], const char *relay_url, bool relay_only,
-                          const uint8_t *alpn, size_t alpn_len, wi_callback callback,
-                          void *context);
+/* One relay of an endpoint's relay map: its URL and the token presented to it, as
+ * "Authorization: Bearer <auth_token>", on each connection to it; NULL for none. A relay outside
+ * the map (a peer's, dialled through wi_endpoint_connect) is never presented any token. */
+typedef struct wi_relay_entry {
+  const char *url;
+  const char *auth_token;
+} wi_relay_entry;
+
+/* Binds an endpoint for `secret_key` over the `relay_count` relays of `relays` (at least one,
+ * copied before return), accepting and dialling the ALPN `alpn`. No discovery service is used: a
+ * peer is addressed by its key, a relay URL and direct addresses. iroh keeps one standing
+ * connection, to its home relay: the map relay its last net report found nearest. It only probes
+ * the others (over HTTPS, at bind and every 20 to 26 s). Each failed connection or redial of the
+ * home relay runs a full net report at once (redials follow iroh's backoff, 10 ms doubling to
+ * 16 s), which makes the nearest relay that answers its probe home, the old home included when it
+ * answers: on localhost a refused home is replaced in about half a second; a relay that drops
+ * packets instead holds the report up to its probe timeout (3 s) and its own (5 s), then a dial
+ * to the new home follows. With every relay down the home stays and is redialled. With `relay_only` it has no IP transport, so every path goes through a relay.
+ * `alpn` may be NULL when `alpn_len` is 0. OK: handles[0] is the wi_endpoint. ERROR: message. */
+uint64_t wi_endpoint_bind(const uint8_t secret_key[32], const wi_relay_entry *relays,
+                          size_t relay_count, bool relay_only, const uint8_t *alpn,
+                          size_t alpn_len, wi_callback callback, void *context);
+
+/* Replaces the token presented to `relay_url`, a relay of the endpoint's map; NULL for none. The
+ * next connection to that relay presents it; a live connection is not touched. OK when the map
+ * holds it. ERROR when the URL is not in the map. */
+uint64_t wi_endpoint_set_auth_token(const wi_endpoint *endpoint, const char *relay_url,
+                                    const char *auth_token, wi_callback callback, void *context);
 
 void wi_endpoint_key(const wi_endpoint *endpoint, uint8_t out_public_key[32]);
 
-/* Dials `public_key` through the endpoint's own relay, the only relay URL this library ever hands
- * iroh. OK: handles[0] is the wi_connection, bytes the verified 32-byte key. ERROR or CLOSED:
- * message. */
+/* Dials `public_key` through `relay_url` (any relay, in the map or not; NULL for none) and the
+ * `address_count` direct addresses `addresses` ("ip:port", copied before return), at least one of
+ * the two. iroh reaches a relay outside the map through a connection of its own, which it closes
+ * after 60 s unused; the endpoint does not report it. OK: handles[0] is the wi_connection, bytes
+ * the verified 32-byte key. ERROR or CLOSED: message. */
 uint64_t wi_endpoint_connect(const wi_endpoint *endpoint, const uint8_t public_key[32],
-                             wi_callback callback, void *context);
+                             const char *relay_url, const char *const *addresses,
+                             size_t address_count, wi_callback callback, void *context);
 
 /* The next incoming connection whose handshake completes. OK: handles[0] is the wi_connection,
  * bytes the caller's 32-byte Ed25519 key as the handshake verified it. CLOSED once the endpoint
@@ -100,19 +124,44 @@ uint64_t wi_endpoint_accept(const wi_endpoint *endpoint, wi_callback callback, v
 uint64_t wi_endpoint_network_change(const wi_endpoint *endpoint, wi_callback callback,
                                     void *context);
 
+typedef enum wi_relay_kind {
+  /* The relay iroh keeps its standing connection to: connected and last_error say how it is. */
+  WI_RELAY_HOME = 0,
+  /* Not connected; the last net report reached it, in latency_micros. */
+  WI_RELAY_REACHABLE = 1,
+  /* Not connected; the last net report did not reach it. */
+  WI_RELAY_UNREACHABLE = 2,
+  /* Not connected; no net report has finished yet. */
+  WI_RELAY_UNPROBED = 3,
+} wi_relay_kind;
+
+/* One relay of the map. connected and last_error are set only for WI_RELAY_HOME (last_error is
+ * empty when it has none), latency_micros only for WI_RELAY_REACHABLE. */
 typedef struct wi_relay_state {
-  bool connected;
   /* NUL-terminated, truncated to fit. */
   char url[256];
+  wi_relay_kind kind;
+  bool connected;
   char last_error[256];
+  uint64_t latency_micros;
 } wi_relay_state;
 
-/* The home relay's state now; false before the endpoint has picked its home relay. */
-bool wi_endpoint_relay_state(const wi_endpoint *endpoint, wi_relay_state *out);
+/* Fills up to `capacity` states, one per relay of the map in URL order, and returns how many the
+ * map has (a larger number than `capacity` fills only `capacity`). No relay is WI_RELAY_HOME until
+ * the endpoint has picked its home. */
+size_t wi_endpoint_relays(const wi_endpoint *endpoint, wi_relay_state *out, size_t capacity);
 
-/* A cursor over the home relay state's changes from now on, for wi_watch_next; NULL on failure.
- * Every cursor sees every change. */
-wi_watch *wi_endpoint_relay_watch(const wi_endpoint *endpoint);
+/* The endpoint's direct addresses as peers may dial them: "ip:port" lines, each ending in '\n',
+ * of the addresses iroh holds now (bound interfaces and what net reports observed), without
+ * loopback, link-local or unspecified IPv4 and without IPv6 outside 2000::/3, sorted. Writes the
+ * text and a NUL when it fits in `capacity`; returns its length either way (0: none). */
+size_t wi_endpoint_direct_addresses(const wi_endpoint *endpoint, char *out, size_t capacity);
+
+/* A cursor over changes to the endpoint's relays (the home relay's state or a net report) and to
+ * its direct addresses from now on, for wi_watch_next; NULL on failure. Every cursor sees every
+ * change; a change may leave what wi_endpoint_relays and wi_endpoint_direct_addresses read as it
+ * was. */
+wi_watch *wi_endpoint_watch(const wi_endpoint *endpoint);
 
 /* Closes every connection and the endpoint. OK when done. The close runs to its end even when this
  * call is cancelled; a later call waits for the same close. */
@@ -201,12 +250,14 @@ void wi_recv_free(wi_recv *recv);
 /* ---- Relay ------------------------------------------------------------------------------- */
 
 /* Admission for the relay. on_connect runs for each client the relay handshake authenticated and
- * decides whether it is admitted; on_disconnect runs exactly once for each admitted connection
- * when it ends. `connection` is unique per process. Both may run concurrently on runtime threads.
+ * decides whether it is admitted; `auth_token` is the client's bearer token (its Authorization
+ * header, else its `token` query parameter), NUL-terminated and valid during the call, or NULL;
+ * on_disconnect runs exactly once for each admitted connection when it ends. `connection` is unique per process. Both may run concurrently on runtime threads.
  * release(context) runs once, after the last callback, when the relay is gone. */
 typedef struct wi_relay_access {
   void *context;
-  bool (*on_connect)(void *context, const uint8_t public_key[32], uint64_t connection);
+  bool (*on_connect)(void *context, const uint8_t public_key[32], uint64_t connection,
+                     const char *auth_token);
   void (*on_disconnect)(void *context, const uint8_t public_key[32], uint64_t connection);
   void (*release)(void *context);
 } wi_relay_access;

@@ -5,3 +5,8 @@ mod op;
 mod relay;
 mod stream;
 mod watch;
+
+/// For the crate's own tests, never part of the C ABI: how many net reports `endpoint` (a
+/// `wi_endpoint`) has run.
+#[doc(hidden)]
+pub use endpoint::net_reports;

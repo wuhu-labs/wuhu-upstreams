@@ -1,8 +1,9 @@
 //! An embedded iroh relay whose admission is the caller's.
 
 use std::{
-    ffi::{c_char, c_void},
+    ffi::{CString, c_char, c_void},
     net::SocketAddr,
+    ptr,
     sync::Arc,
 };
 
@@ -19,7 +20,7 @@ use crate::op::{Outcome, RunOnce, detach, guard, handle, key, spawn, text, wi_ca
 #[allow(non_camel_case_types)]
 pub struct wi_relay_access {
     context: *mut c_void,
-    on_connect: Option<unsafe extern "C" fn(*mut c_void, *const u8, u64) -> bool>,
+    on_connect: Option<unsafe extern "C" fn(*mut c_void, *const u8, u64, *const c_char) -> bool>,
     on_disconnect: Option<unsafe extern "C" fn(*mut c_void, *const u8, u64)>,
     release: Option<unsafe extern "C" fn(*mut c_void)>,
 }
@@ -28,7 +29,7 @@ pub struct wi_relay_access {
 struct CallerAccess {
     context: usize,
     #[allow(clippy::type_complexity)]
-    on_connect: Option<unsafe extern "C" fn(*mut c_void, *const u8, u64) -> bool>,
+    on_connect: Option<unsafe extern "C" fn(*mut c_void, *const u8, u64, *const c_char) -> bool>,
     on_disconnect: Option<unsafe extern "C" fn(*mut c_void, *const u8, u64)>,
     release: Option<unsafe extern "C" fn(*mut c_void)>,
 }
@@ -42,7 +43,9 @@ impl Drop for CallerAccess {
 }
 
 fn connection_number(id: ConnectionId) -> u64 {
-    id.to_string().parse().expect("ConnectionId displays its number")
+    id.to_string()
+        .parse()
+        .expect("ConnectionId displays its number")
 }
 
 impl AccessControl for CallerAccess {
@@ -52,7 +55,12 @@ impl AccessControl for CallerAccess {
         };
         let key = *request.endpoint_id().as_bytes();
         let number = connection_number(request.connection_id());
-        if unsafe { on_connect(self.context as *mut c_void, key.as_ptr(), number) } {
+        // A token with a NUL in it cannot be handed over as C text; it is no token.
+        let token = request
+            .auth_token()
+            .and_then(|token| CString::new(token).ok());
+        let token = token.as_ref().map_or(ptr::null(), |token| token.as_ptr());
+        if unsafe { on_connect(self.context as *mut c_void, key.as_ptr(), number, token) } {
             Access::Allow
         } else {
             Access::Deny { reason: None }
@@ -132,7 +140,9 @@ pub unsafe extern "C" fn wi_relay_spawn(
     spawn(callback, context, async move {
         let address: SocketAddr = match address.as_deref().map(str::parse) {
             Some(Ok(address)) => address,
-            Some(Err(e)) => return Outcome::Error(format!("address {}: {e}", address.unwrap_or_default())),
+            Some(Err(e)) => {
+                return Outcome::Error(format!("address {}: {e}", address.unwrap_or_default()));
+            }
             None => return Outcome::Error("no address".into()),
         };
         let mut relay = match pem {
@@ -146,7 +156,11 @@ pub unsafe extern "C" fn wi_relay_spawn(
                 }
                 relay
             }
-            _ => return Outcome::Error("a certificate chain needs its key, and a key its chain".into()),
+            _ => {
+                return Outcome::Error(
+                    "a certificate chain needs its key, and a key its chain".into(),
+                );
+            }
         };
         relay.access = Arc::new(access);
         let tls = relay.tls.is_some();
@@ -160,7 +174,11 @@ pub unsafe extern "C" fn wi_relay_spawn(
                     .clone();
                 Outcome::Handle(handle(wi_relay {
                     metrics: server.metrics().server.clone(),
-                    address: if tls { server.https_addr() } else { server.http_addr() },
+                    address: if tls {
+                        server.https_addr()
+                    } else {
+                        server.http_addr()
+                    },
                     service,
                     server: Arc::new(Mutex::new(Some(server))),
                     shutdown: RunOnce::new(),
@@ -172,7 +190,11 @@ pub unsafe extern "C" fn wi_relay_spawn(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wi_relay_address(relay: *const wi_relay, out: *mut c_char, capacity: usize) -> usize {
+pub unsafe extern "C" fn wi_relay_address(
+    relay: *const wi_relay,
+    out: *mut c_char,
+    capacity: usize,
+) -> usize {
     let relay = unsafe { &*relay };
     guard(0, || {
         let Some(address) = relay.address else {
@@ -191,7 +213,11 @@ pub unsafe extern "C" fn wi_relay_address(relay: *const wi_relay, out: *mut c_ch
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wi_relay_traffic(relay: *const wi_relay, sent: *mut u64, received: *mut u64) {
+pub unsafe extern "C" fn wi_relay_traffic(
+    relay: *const wi_relay,
+    sent: *mut u64,
+    received: *mut u64,
+) {
     let relay = unsafe { &*relay };
     guard((), || unsafe {
         *sent = relay.metrics.bytes_sent.get();
@@ -200,7 +226,10 @@ pub unsafe extern "C" fn wi_relay_traffic(relay: *const wi_relay, sent: *mut u64
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wi_relay_disconnect(relay: *const wi_relay, public_key: *const u8) -> bool {
+pub unsafe extern "C" fn wi_relay_disconnect(
+    relay: *const wi_relay,
+    public_key: *const u8,
+) -> bool {
     let relay = unsafe { &*relay };
     let key = unsafe { key(public_key) };
     guard(false, || {
@@ -219,12 +248,14 @@ pub unsafe extern "C" fn wi_relay_shutdown(
 ) -> u64 {
     let this = unsafe { &*relay };
     let server = this.server.clone();
-    let shutdown = this.shutdown.run(Err("panic in wuhu_iroh".into()), || async move {
-        let Some(server) = server.lock().await.take() else {
-            return Ok(());
-        };
-        server.shutdown().await.map_err(|e| e.to_string())
-    });
+    let shutdown = this
+        .shutdown
+        .run(Err("panic in wuhu_iroh".into()), || async move {
+            let Some(server) = server.lock().await.take() else {
+                return Ok(());
+            };
+            server.shutdown().await.map_err(|e| e.to_string())
+        });
     spawn(callback, context, async move {
         match shutdown.await {
             Ok(()) => Outcome::Ok,

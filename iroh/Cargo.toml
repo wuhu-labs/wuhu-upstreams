@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 futures-util = "0.3.34"
-iroh = "=1.5.0"
+iroh = { version = "=1.5.0", features = ["unstable-net-report"] }
 iroh-relay = { version = "=1.5.0", features = ["server"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync", "macros"] }

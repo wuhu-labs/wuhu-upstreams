@@ -20,10 +20,17 @@ struct WiResult {
     message: *const c_char,
 }
 
+#[repr(C)]
+struct RelayEntry {
+    url: *const c_char,
+    auth_token: *const c_char,
+}
+
 unsafe extern "C" {
     fn wi_endpoint_bind(
         secret: *const u8,
-        relay: *const c_char,
+        relays: *const RelayEntry,
+        relay_count: usize,
         relay_only: bool,
         alpn: *const u8,
         alpn_len: usize,
@@ -40,17 +47,27 @@ unsafe extern "C" fn record(_: *mut c_void, result: *const WiResult) {
 
 #[test]
 fn without_threads_an_operation_ends_in_error_on_the_calling_thread() {
-    let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NPROC, &mut limit) }, 0);
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NPROC, &mut limit) },
+        0
+    );
     limit.rlim_cur = 1;
     assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &limit) }, 0);
     let secret = [1u8; 32];
-    let relay = c"http://127.0.0.1:1";
+    let relay = RelayEntry {
+        url: c"http://127.0.0.1:1".as_ptr(),
+        auth_token: std::ptr::null(),
+    };
     let alpn = b"wuhu/test/0";
     unsafe {
         wi_endpoint_bind(
             secret.as_ptr(),
-            relay.as_ptr(),
+            &relay,
+            1,
             true,
             alpn.as_ptr(),
             alpn.len(),

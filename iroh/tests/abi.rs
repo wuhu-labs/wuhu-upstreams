@@ -2,7 +2,11 @@
 
 mod common;
 
-use std::{ffi::{CStr, CString, c_char, c_void}, ptr, time::Duration};
+use std::{
+    ffi::{CStr, CString, c_char, c_void},
+    ptr,
+    time::Duration,
+};
 
 use common::*;
 /// The server drops off the relay for good, so the client's close drains for a while: the
@@ -18,14 +22,18 @@ fn a_close_cancelled_midway_still_runs_to_its_end() {
         wi_endpoint_key(client, client_key.as_mut_ptr());
     }
     let accepted = call(|cb, cx| unsafe { wi_endpoint_accept(server, cb, cx) });
-    let outgoing = ok(call(|cb, cx| unsafe {
-        wi_endpoint_connect(client, server_key.as_ptr(), cb, cx)
-    }))
-    .handles[0] as *mut c_void;
+    let outgoing = ok(dial(client, &server_key, &url)).handles[0] as *mut c_void;
     let incoming = ok(accepted).handles[0] as *mut c_void;
-    let opened = ok(call(|cb, cx| unsafe { wi_connection_open(outgoing, cb, cx) }));
-    let (send, recv) = (opened.handles[0] as *mut c_void, opened.handles[1] as *mut c_void);
-    ok(call(|cb, cx| unsafe { wi_send_write(send, b"hi".as_ptr(), 2, cb, cx) }));
+    let opened = ok(call(|cb, cx| unsafe {
+        wi_connection_open(outgoing, cb, cx)
+    }));
+    let (send, recv) = (
+        opened.handles[0] as *mut c_void,
+        opened.handles[1] as *mut c_void,
+    );
+    ok(call(|cb, cx| unsafe {
+        wi_send_write(send, b"hi".as_ptr(), 2, cb, cx)
+    }));
     let pending = call(|cb, cx| unsafe { wi_recv_read(recv, 65536, cb, cx) });
 
     SHUT_OUT.lock().unwrap().push(server_key);
@@ -39,9 +47,16 @@ fn a_close_cancelled_midway_still_runs_to_its_end() {
     let first = wait(first);
     assert!(first.status == 5 || first.status == 0, "{first:?}");
     ok(call(|cb, cx| unsafe { wi_endpoint_close(client, cb, cx) }));
-    assert_eq!(wait(pending).status, 4, "the in-flight read ends with the close");
+    assert_eq!(
+        wait(pending).status,
+        4,
+        "the in-flight read ends with the close"
+    );
     assert!(
-        eventually(Duration::from_secs(2), || GONE.lock().unwrap().contains(&client_key)),
+        eventually(Duration::from_secs(2), || GONE
+            .lock()
+            .unwrap()
+            .contains(&client_key)),
         "the client's relay connection ended with its close",
     );
 
@@ -77,27 +92,42 @@ fn echo_through_relay_and_kick() {
     }
 
     let accepted = call(|cb, cx| unsafe { wi_endpoint_accept(server, cb, cx) });
-    let dialled = ok(call(|cb, cx| unsafe {
-        wi_endpoint_connect(client, server_key.as_ptr(), cb, cx)
-    }));
+    let dialled = ok(dial(client, &server_key, &url));
     assert_eq!(dialled.bytes, server_key);
     let outgoing = dialled.handles[0] as *mut c_void;
 
     let (send, recv) = {
-        let opened = ok(call(|cb, cx| unsafe { wi_connection_open(outgoing, cb, cx) }));
-        (opened.handles[0] as *mut c_void, opened.handles[1] as *mut c_void)
+        let opened = ok(call(|cb, cx| unsafe {
+            wi_connection_open(outgoing, cb, cx)
+        }));
+        (
+            opened.handles[0] as *mut c_void,
+            opened.handles[1] as *mut c_void,
+        )
     };
-    ok(call(|cb, cx| unsafe { wi_send_write(send, b"ping".as_ptr(), 4, cb, cx) }));
+    ok(call(|cb, cx| unsafe {
+        wi_send_write(send, b"ping".as_ptr(), 4, cb, cx)
+    }));
     assert_eq!(unsafe { wi_send_finish(send) }, 0);
 
     let accepted = ok(accepted);
-    assert_eq!(accepted.bytes, client_key, "accept carries the caller's key");
+    assert_eq!(
+        accepted.bytes, client_key,
+        "accept carries the caller's key"
+    );
     let incoming = accepted.handles[0] as *mut c_void;
-    let stream = ok(call(|cb, cx| unsafe { wi_connection_accept(incoming, cb, cx) }));
-    let (peer_send, peer_recv) = (stream.handles[0] as *mut c_void, stream.handles[1] as *mut c_void);
+    let stream = ok(call(|cb, cx| unsafe {
+        wi_connection_accept(incoming, cb, cx)
+    }));
+    let (peer_send, peer_recv) = (
+        stream.handles[0] as *mut c_void,
+        stream.handles[1] as *mut c_void,
+    );
     let mut request = Vec::new();
     loop {
-        let read = wait(call(|cb, cx| unsafe { wi_recv_read(peer_recv, 65536, cb, cx) }));
+        let read = wait(call(|cb, cx| unsafe {
+            wi_recv_read(peer_recv, 65536, cb, cx)
+        }));
         match read.status {
             0 => request.extend(read.bytes),
             1 => break,
@@ -105,12 +135,17 @@ fn echo_through_relay_and_kick() {
         }
     }
     assert_eq!(request, b"ping");
-    ok(call(|cb, cx| unsafe { wi_send_write(peer_send, request.as_ptr(), request.len(), cb, cx) }));
+    ok(call(|cb, cx| unsafe {
+        wi_send_write(peer_send, request.as_ptr(), request.len(), cb, cx)
+    }));
     assert_eq!(unsafe { wi_send_finish(peer_send) }, 0);
 
     let read = ok(call(|cb, cx| unsafe { wi_recv_read(recv, 65536, cb, cx) }));
     assert_eq!(read.bytes, b"ping");
-    assert_eq!(wait(call(|cb, cx| unsafe { wi_recv_read(recv, 65536, cb, cx) })).status, 1);
+    assert_eq!(
+        wait(call(|cb, cx| unsafe { wi_recv_read(recv, 65536, cb, cx) })).status,
+        1
+    );
 
     let pending = call(|cb, cx| unsafe {
         let id = wi_recv_read(peer_recv, 1, cb, cx);
@@ -118,7 +153,10 @@ fn echo_through_relay_and_kick() {
         id
     });
     let cancelled = wait(pending);
-    assert!(cancelled.status == 5 || cancelled.status == 1, "{cancelled:?}");
+    assert!(
+        cancelled.status == 5 || cancelled.status == 1,
+        "{cancelled:?}"
+    );
 
     assert!(unsafe { wi_relay_disconnect(relay, client_key.as_ptr()) });
     assert!(!unsafe { wi_relay_disconnect(relay, DENIED.as_ptr()) });
@@ -135,7 +173,11 @@ fn echo_through_relay_and_kick() {
     let closed = wait(closed);
     assert_eq!((closed.status, closed.code), (4, 7), "{}", closed.message);
     let closed_here = wait(closed_here);
-    assert_eq!((closed_here.status, closed_here.code), (4, 7), "our own close reports our code");
+    assert_eq!(
+        (closed_here.status, closed_here.code),
+        (4, 7),
+        "our own close reports our code"
+    );
     unsafe {
         wi_connection_free(outgoing);
         wi_connection_free(incoming);
@@ -151,7 +193,11 @@ fn a_finish_while_a_write_is_pending_finishes_nothing_and_the_write_lands_whole(
     let ([send, recv], [peer_send, peer_recv]) = link.stream(b"x");
     let body = vec![7u8; 4 << 20];
     let write = call(|cb, cx| unsafe { wi_send_write(send, body.as_ptr(), body.len(), cb, cx) });
-    assert_eq!(unsafe { wi_send_finish(send) }, 6, "ERROR while the write is pending");
+    assert_eq!(
+        unsafe { wi_send_finish(send) },
+        6,
+        "ERROR while the write is pending"
+    );
     let peer = peer_recv as usize;
     let reader = std::thread::spawn(move || read_to_end(peer as *mut c_void));
     ok(write);
@@ -172,7 +218,10 @@ fn a_read_of_at_most_zero_bytes_is_an_error_and_takes_nothing() {
     let link = Link::new([13, 14]);
     let ([send, recv], [peer_send, peer_recv]) = link.stream(b"ab");
     assert_eq!(unsafe { wi_send_finish(send) }, 0);
-    assert_eq!(wait(call(|cb, cx| unsafe { wi_recv_read(peer_recv, 0, cb, cx) })).status, 6);
+    assert_eq!(
+        wait(call(|cb, cx| unsafe { wi_recv_read(peer_recv, 0, cb, cx) })).status,
+        6
+    );
     assert_eq!(read_to_end(peer_recv), b"ab");
     unsafe {
         wi_send_free(send);
@@ -221,13 +270,19 @@ fn stopped_reports_the_peers_stop_code_while_no_write_is_pending() {
 fn an_empty_alpn_may_come_without_a_buffer() {
     let (relay, url) = spawn_relay();
     let secret = [17u8; 32];
+    let entry = RelayEntry {
+        url: url.as_ptr(),
+        auth_token: ptr::null(),
+    };
     let bound = wait(call(|cb, cx| unsafe {
-        wi_endpoint_bind(secret.as_ptr(), url.as_ptr(), true, ptr::null(), 0, cb, cx)
+        wi_endpoint_bind(secret.as_ptr(), &entry, 1, true, ptr::null(), 0, cb, cx)
     }));
     assert!(bound.status == 0 || bound.status == 6, "{bound:?}");
     if bound.status == 0 {
         let endpoint = bound.handles[0] as *mut c_void;
-        ok(call(|cb, cx| unsafe { wi_endpoint_close(endpoint, cb, cx) }));
+        ok(call(|cb, cx| unsafe {
+            wi_endpoint_close(endpoint, cb, cx)
+        }));
         unsafe { wi_endpoint_free(endpoint) };
     }
     unsafe { wi_relay_free(relay) };
@@ -242,17 +297,24 @@ fn two_relay_watches_each_see_a_kick() {
     assert!(eventually(Duration::from_secs(3), || unsafe {
         wi_relay_disconnect(relay, DENIED.as_ptr()) || wi_relay_disconnect(relay, key.as_ptr())
     }));
-    let watches = [unsafe { wi_endpoint_relay_watch(endpoint) }, unsafe {
-        wi_endpoint_relay_watch(endpoint)
+    let watches = [unsafe { wi_endpoint_watch(endpoint) }, unsafe {
+        wi_endpoint_watch(endpoint)
     }];
     let next = watches.map(|watch| call(|cb, cx| unsafe { wi_watch_next(watch, cb, cx) }));
-    assert!(eventually(Duration::from_secs(3), || unsafe { wi_relay_disconnect(relay, key.as_ptr()) }));
+    assert!(eventually(Duration::from_secs(3), || unsafe {
+        wi_relay_disconnect(relay, key.as_ptr())
+    }));
     for next in next {
         ok(next);
     }
-    ok(call(|cb, cx| unsafe { wi_endpoint_close(endpoint, cb, cx) }));
+    ok(call(|cb, cx| unsafe {
+        wi_endpoint_close(endpoint, cb, cx)
+    }));
     for watch in watches {
-        assert_eq!(wait(call(|cb, cx| unsafe { wi_watch_next(watch, cb, cx) })).status, 4);
+        assert_eq!(
+            wait(call(|cb, cx| unsafe { wi_watch_next(watch, cb, cx) })).status,
+            4
+        );
         unsafe { wi_watch_free(watch) };
     }
     unsafe {
@@ -275,12 +337,22 @@ fn a_relay_with_its_own_certificate_serves_https_on_its_address() {
         release: None,
     };
     let relay = ok(call(|cb, cx| unsafe {
-        wi_relay_spawn(address.as_ptr(), cert.as_ptr(), key.as_ptr(), access, cb, cx)
+        wi_relay_spawn(
+            address.as_ptr(),
+            cert.as_ptr(),
+            key.as_ptr(),
+            access,
+            cb,
+            cx,
+        )
     }))
     .handles[0] as *mut c_void;
     let mut out = [0 as c_char; 64];
     assert!(unsafe { wi_relay_address(relay, out.as_mut_ptr(), 64) } > 0);
-    let bound = unsafe { CStr::from_ptr(out.as_ptr()) }.to_str().unwrap().to_owned();
+    let bound = unsafe { CStr::from_ptr(out.as_ptr()) }
+        .to_str()
+        .unwrap()
+        .to_owned();
 
     let mut roots = rustls::RootCertStore::empty();
     roots.add(certified.cert.der().clone()).unwrap();
@@ -291,13 +363,13 @@ fn a_relay_with_its_own_certificate_serves_https_on_its_address() {
     .unwrap()
     .with_root_certificates(roots)
     .with_no_client_auth();
-    let tls = rustls::ClientConnection::new(
-        std::sync::Arc::new(config),
-        "localhost".try_into().unwrap(),
-    )
-    .unwrap();
+    let tls =
+        rustls::ClientConnection::new(std::sync::Arc::new(config), "localhost".try_into().unwrap())
+            .unwrap();
     let socket = std::net::TcpStream::connect(&bound).unwrap();
-    socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
     let mut stream = rustls::StreamOwned::new(tls, socket);
     stream
         .write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
