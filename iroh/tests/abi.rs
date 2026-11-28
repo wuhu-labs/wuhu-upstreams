@@ -158,9 +158,6 @@ fn echo_through_relay_and_kick() {
         "{cancelled:?}"
     );
 
-    assert!(unsafe { wi_relay_disconnect(relay, client_key.as_ptr()) });
-    assert!(!unsafe { wi_relay_disconnect(relay, DENIED.as_ptr()) });
-
     unsafe {
         wi_send_free(send);
         wi_recv_free(recv);
@@ -178,6 +175,10 @@ fn echo_through_relay_and_kick() {
         (4, 7),
         "our own close reports our code"
     );
+    // The kick comes after the close: a close sent while the client is off the relay can be lost,
+    // and the server's connection then ends later with code 0 (seen once in CI).
+    assert!(unsafe { wi_relay_disconnect(relay, client_key.as_ptr()) });
+    assert!(!unsafe { wi_relay_disconnect(relay, DENIED.as_ptr()) });
     unsafe {
         wi_connection_free(outgoing);
         wi_connection_free(incoming);
