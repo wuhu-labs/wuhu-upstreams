@@ -149,7 +149,8 @@ uint64_t wi_endpoint_accept(const wi_endpoint *endpoint, wi_callback callback, v
  * established since. It always does when the interfaces changed, when its dial presents a token
  * the map no longer holds, or with `after_suspension`, which the caller passes when the device was
  * just suspended (a short suspension can kill a dial's socket without moving the clock far); a
- * suspension is kept until each relay's next check takes it. A check whose deadline passes before
+ * suspension reaches every relay at once, whatever its queue holds, and needs no later check: a
+ * dial restarts, a backoff ends, a connected relay is checked. A check whose deadline passes before
  * the connection's first pong fails that attempt like a refusal: recorded, then backed off. OK
  * when iroh has taken it in. */
 uint64_t wi_endpoint_network_change(const wi_endpoint *endpoint, bool after_suspension,
