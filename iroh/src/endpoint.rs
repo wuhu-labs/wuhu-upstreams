@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use iroh::{
     Endpoint, EndpointAddr, PublicKey, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
     Watcher,
-    endpoint::{Connection, ConnectionError, PortmapperConfig, VarInt, presets},
+    endpoint::{Connection, ConnectionError, VarInt, presets},
 };
 use crate::op::{Outcome, RunOnce, guard, handle, key, runtime, spawn, text, wi_callback};
 use crate::stream::{RecvHandle, SendHandle};
@@ -145,8 +145,7 @@ pub unsafe extern "C" fn wi_endpoint_bind(
         let mut builder = Endpoint::builder(presets::Minimal)
             .secret_key(secret)
             .alpns(vec![alpn.clone()])
-            .relay_mode(RelayMode::Custom(relays.clone()))
-            .portmapper_config(PortmapperConfig::Disabled);
+            .relay_mode(RelayMode::Custom(relays.clone()));
         if relay_only {
             builder = builder.clear_ip_transports();
         }
