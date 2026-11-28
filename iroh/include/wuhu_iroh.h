@@ -94,7 +94,7 @@ typedef struct wi_relay_entry {
  * iroh redials a failed relay with its backoff, 10 ms doubling to 16 s. A relay whose latest
  * connection failed before it was established (a refused token, a broken upgrade, a failed dial)
  * is passed over as home while the report reached another relay; with only such relays reached,
- * the one whose failure is oldest is home. A relay's first such failure since it last connected
+ * the one home longest ago (or never) is home. A relay's first such failure since it last connected
  * runs a full report at once (no report per failed redial), so a home relay that answers probes
  * but refuses its connection is replaced within that report: on localhost about half a second; a
  * relay that drops packets instead holds the report up to its probe timeout (3 s) and its own

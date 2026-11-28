@@ -459,8 +459,8 @@ fn direct_addresses_are_dialable_ones_and_a_dial_by_address_alone_connects() {
 
 /// Both relays answer every probe and refuse every connection. iroh redials each with its
 /// backoff, but runs a report only for a relay's first failure since it last connected: no
-/// report per failed dial. With only failing relays reached, the oldest failure is home, so the
-/// home moves off the first relay to fail and back to it once the other has failed too.
+/// report per failed dial. With only failing relays reached, the one home longest ago is home, so
+/// the home moves off the first relay to fail and back to it once the other has failed too.
 #[test]
 fn relays_that_refuse_every_dial_run_a_report_per_first_failure_only_and_trade_home() {
     let (relay_a, url_a, seen_a) = door_relay(|_, _| false);
