@@ -483,7 +483,10 @@ fn relays_that_refuse_every_dial_run_a_report_per_first_failure_only_and_trade_h
     // The bind's reports, then one per relay's first failure.
     assert!(reports <= 6, "{reports} net reports in 8 s");
     assert!(dials > reports as usize, "{dials} refused dials");
-    assert!(homes.len() >= 3, "the home went A, B, A (or B, A, B): {homes:?}");
+    assert!(
+        homes.len() >= 3,
+        "the home went A, B, A (or B, A, B): {homes:?}"
+    );
     assert_eq!(homes[0], homes[2], "{homes:?}");
     for state in relays(endpoint) {
         if is_home(state.kind) {
@@ -529,14 +532,8 @@ fn a_home_relay_that_answers_probes_but_refuses_every_connection_loses_home_to_o
     assert!(!a.last_error().is_empty(), "{a:?}");
 
     for _ in 0..3 {
-        let before = unsafe { wuhu_iroh::net_reports(endpoint) };
+        // Returns once a full report completed, A probed in it.
         unsafe { wuhu_iroh::run_net_report(endpoint) };
-        assert!(
-            eventually(Duration::from_secs(3), || unsafe {
-                wuhu_iroh::net_reports(endpoint)
-            } > before),
-            "the report ran"
-        );
         let until = Instant::now() + Duration::from_millis(700);
         while Instant::now() < until {
             assert_eq!(
@@ -749,7 +746,8 @@ fn a_dial_naming_a_failed_relay_connects_at_once_with_its_current_token() {
         started.elapsed()
     );
     assert!(
-        eventually(Duration::from_secs(1), || state_of(endpoint, &url_a).kind != FAILED),
+        eventually(Duration::from_secs(1), || state_of(endpoint, &url_a).kind
+            != FAILED),
         "the dial's connection to A ended its failure"
     );
     assert_eq!(
@@ -841,6 +839,273 @@ fn direct_addresses_are_this_hosts_interface_addresses_only() {
             local.contains(&address.ip()),
             "{address} is no interface address: {local:?}"
         );
+    }
+    close(endpoint);
+    unsafe { wi_relay_free(relay) };
+}
+
+/// A relay behind a TCP forwarder that counts relay upgrade requests and, while `hold` is
+/// set, keeps each one 2 s before it forwards it: the client's upgrade is in flight all that
+/// time. The relay refuses every client while `refuse` is set.
+#[derive(Default)]
+struct Holding {
+    hold: std::sync::atomic::AtomicBool,
+    refuse: std::sync::atomic::AtomicBool,
+    upgrades: std::sync::atomic::AtomicUsize,
+}
+
+impl Holding {
+    fn set(flag: &std::sync::atomic::AtomicBool, on: bool) {
+        flag.store(on, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn upgrades(&self) -> usize {
+        self.upgrades.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+unsafe extern "C" fn admit_unless_refusing(
+    context: *mut c_void,
+    _: *const u8,
+    _: u64,
+    _: *const c_char,
+) -> bool {
+    let holding = unsafe { &*(context as *const Holding) };
+    !holding.refuse.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn holding_relay() -> (*mut c_void, CString, &'static Holding) {
+    use std::{
+        io::{Read, Write},
+        net::{Shutdown, TcpListener, TcpStream},
+        sync::atomic::Ordering,
+    };
+    let holding: &'static Holding = Box::leak(Box::default());
+    let (relay, direct) = spawn_relay_access(Access {
+        context: holding as *const Holding as *mut c_void,
+        on_connect: Some(admit_unless_refusing),
+        on_disconnect: None,
+        release: None,
+    });
+    let target = direct
+        .to_str()
+        .unwrap()
+        .trim_start_matches("http://")
+        .to_string();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = CString::new(format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    std::thread::spawn(move || {
+        for mut client in listener.incoming().flatten() {
+            let target = target.clone();
+            std::thread::spawn(move || {
+                // Slower than a relay reached directly, so a relay beside it probes nearer.
+                std::thread::sleep(Duration::from_millis(40));
+                let mut first = vec![0u8; 4096];
+                let Ok(n) = client.read(&mut first) else {
+                    return;
+                };
+                first.truncate(n);
+                if first.windows(7).any(|w| w == b" /relay") {
+                    holding.upgrades.fetch_add(1, Ordering::SeqCst);
+                    if holding.hold.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_secs(2));
+                    }
+                }
+                let Ok(mut server) = TcpStream::connect(&target) else {
+                    return;
+                };
+                if server.write_all(&first).is_err() {
+                    return;
+                }
+                let (mut c, mut s) = (client.try_clone().unwrap(), server.try_clone().unwrap());
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut c, &mut s);
+                    let _ = s.shutdown(Shutdown::Write);
+                });
+                let _ = std::io::copy(&mut server, &mut client);
+                let _ = client.shutdown(Shutdown::Write);
+            });
+        }
+    });
+    (relay, url, holding)
+}
+
+/// Starts a dial of `key` through `url` naming `addresses`; the operation, for `wi_cancel`.
+fn dial_naming(
+    endpoint: *mut c_void,
+    key: &[u8; 32],
+    url: &CString,
+    addresses: &[CString],
+) -> (u64, std::sync::mpsc::Receiver<Done>) {
+    let pointers: Vec<*const c_char> = addresses.iter().map(|a| a.as_ptr()).collect();
+    let mut operation = 0;
+    let done = call(|cb, cx| {
+        operation = unsafe {
+            wi_endpoint_connect(
+                endpoint,
+                key.as_ptr(),
+                url.as_ptr(),
+                pointers.as_ptr(),
+                pointers.len(),
+                cb,
+                cx,
+            )
+        };
+        operation
+    });
+    (operation, done)
+}
+
+/// The endpoint is home on B and redials B after B dropped it; B holds that upgrade 2 s. A dial
+/// naming failed A meanwhile retries A only: B's upgrade in flight completes, the only one sent.
+#[test]
+fn a_dial_naming_a_failed_relay_leaves_another_relays_upgrade_in_flight_alone() {
+    let (relay_a, url_a) = spawn_relay_access(Access {
+        context: ptr::null_mut(),
+        on_connect: Some(deny),
+        on_disconnect: None,
+        release: None,
+    });
+    let (relay_b, url_b, holding) = holding_relay();
+    let endpoint = bind_to(52, &[(&url_a, None), (&url_b, None)]);
+    let key = key_of(endpoint);
+    assert!(
+        eventually(Duration::from_secs(3), || connected_home(endpoint)
+            == Some(reported(&url_b))),
+        "{:?}",
+        relays(endpoint)
+    );
+    assert_eq!(state_of(endpoint, &url_a).kind, FAILED);
+
+    Holding::set(&holding.hold, true);
+    let before = holding.upgrades();
+    assert!(unsafe { wi_relay_disconnect(relay_b, key.as_ptr()) });
+    assert!(
+        eventually(Duration::from_secs(3), || holding.upgrades() > before),
+        "B's redial sent its upgrade"
+    );
+    let (operation, _dial) = dial_naming(endpoint, &public_key(53), &url_a, &[]);
+    assert!(
+        eventually(Duration::from_secs(5), || connected_home(endpoint)
+            == Some(reported(&url_b))),
+        "{:?}",
+        relays(endpoint)
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let upgrades = holding.upgrades() - before;
+    assert_eq!(upgrades, 1, "B's upgrade in flight was restarted");
+    unsafe { wi_cancel(operation) };
+    close(endpoint);
+    unsafe {
+        wi_relay_free(relay_a);
+        wi_relay_free(relay_b);
+    }
+}
+
+/// A dial naming more than 16 addresses fails with the cap's error before it touches a relay:
+/// failed A, in a redial backoff of 2.56 s or more, isn't retried; a dial with 16 is, at once.
+#[test]
+fn a_dial_naming_seventeen_addresses_fails_before_it_retries_the_relay_and_one_naming_sixteen_retries_it()
+ {
+    let (relay_a, url_a, seen_a) = door_relay(|_, _| false);
+    let (relay_b, direct_b) = spawn_relay();
+    let url_b = slow_proxy(&direct_b);
+    let endpoint = bind_to(54, &[(&url_a, None), (&url_b, None)]);
+    let key = key_of(endpoint);
+    assert!(
+        eventually(Duration::from_secs(10), || seen_a.tokens(&key).len() >= 9),
+        "{} refusals",
+        seen_a.tokens(&key).len()
+    );
+    assert_eq!(state_of(endpoint, &url_a).kind, FAILED);
+    let refusals = seen_a.tokens(&key).len();
+    let addresses = |count: u8| -> Vec<CString> {
+        (1..=count)
+            .map(|n| CString::new(format!("192.0.2.{n}:4433")).unwrap())
+            .collect()
+    };
+    let started = Instant::now();
+    let (_, seventeen) = dial_naming(endpoint, &public_key(55), &url_a, &addresses(17));
+    let failed = seventeen
+        .recv_timeout(Duration::from_secs(1))
+        .expect("an answer");
+    assert_ne!(failed.status, 0);
+    assert!(failed.message.contains("at most 16"), "{}", failed.message);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(seen_a.tokens(&key).len(), refusals, "A was retried");
+
+    let (operation, _sixteen) = dial_naming(endpoint, &public_key(55), &url_a, &addresses(16));
+    assert!(
+        eventually(Duration::from_millis(800), || seen_a.tokens(&key).len()
+            > refusals),
+        "A wasn't retried"
+    );
+    assert!(started.elapsed() < Duration::from_millis(2500));
+    unsafe { wi_cancel(operation) };
+    close(endpoint);
+    unsafe {
+        wi_relay_free(relay_a);
+        wi_relay_free(relay_b);
+    }
+}
+
+/// `HOME_CONNECTING` names the latest dial or upgrade failure since the home was last
+/// connected: none while it redials after a connection that was established and then lost,
+/// again after a refusal came and a later connection ended it.
+#[test]
+fn a_home_redialling_after_an_established_connection_was_lost_names_no_error() {
+    let (relay, url, holding) = holding_relay();
+    let endpoint = bind(56, &url);
+    let key = key_of(endpoint);
+    let set = Holding::set;
+    for round in 0..2 {
+        assert!(eventually(Duration::from_secs(5), || connected_home(
+            endpoint
+        )
+        .is_some()));
+        // Established at its first pong, which answers the ping sent on connecting: a
+        // connection lost before it is a failed attempt, named as such.
+        std::thread::sleep(Duration::from_millis(300));
+        set(&holding.hold, true);
+        assert!(unsafe { wi_relay_disconnect(relay, key.as_ptr()) });
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        let mut connecting = Vec::new();
+        while Instant::now() < deadline {
+            let state = &relays(endpoint)[0];
+            if state.kind == HOME_CONNECTING {
+                connecting.push(state.last_error());
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        set(&holding.hold, false);
+        eprintln!("round {round}: {} samples connecting", connecting.len());
+        assert!(
+            !connecting.is_empty(),
+            "round {round}: never seen redialling"
+        );
+        assert!(
+            connecting.iter().all(String::is_empty),
+            "round {round}: {:?}",
+            connecting.iter().find(|error| !error.is_empty())
+        );
+        assert!(eventually(Duration::from_secs(5), || connected_home(
+            endpoint
+        )
+        .is_some()));
+        if round == 0 {
+            // A refusal is named while it is the latest failure; the next connection ends it.
+            set(&holding.refuse, true);
+            assert!(unsafe { wi_relay_disconnect(relay, key.as_ptr()) });
+            assert!(
+                eventually(Duration::from_secs(3), || {
+                    let state = &relays(endpoint)[0];
+                    state.kind != HOME_CONNECTED && !state.last_error().is_empty()
+                }),
+                "{:?}",
+                relays(endpoint)
+            );
+            set(&holding.refuse, false);
+        }
     }
     close(endpoint);
     unsafe { wi_relay_free(relay) };

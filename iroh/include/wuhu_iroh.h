@@ -90,12 +90,16 @@ typedef struct wi_relay_entry {
  * in a net report at bind and every 20 to 26 s). A report makes home the relay with the best
  * latency over its last 5 minutes of reports, but keeps the old home unless the new one's latency
  * is below 2/3 of the old one's: two similarly near relays can trade home on a missed probe or on
- * jitter, and a home relay that recovers from an outage is not guaranteed to be home again.
+ * jitter, and a home relay that recovers from an outage is not guaranteed to be home again. A full
+ * report (at bind, every 5 minutes, after a map or network change, after a relay's first failure)
+ * keeps no history, so the 2/3 rule does not apply to it: it takes its own best latency.
  * iroh redials a failed relay with its backoff, 10 ms doubling to 16 s. A relay whose latest
- * connection failed before it was established (a refused token, a broken upgrade, a failed dial)
- * is passed over as home while the report reached another relay; with only such relays reached,
- * the one home longest ago (or never) is home. A relay's first such failure since it last connected
- * runs a full report at once (no report per failed redial), so a home relay that answers probes
+ * connection failed before it was established (at its first pong: a refused token, a broken
+ * upgrade, a failed dial, silence before that pong) is passed over as home while the report
+ * reached another relay; with only such relays reached, the one home longest ago (or never) is
+ * home. Only relays of the map are recorded; a failed relay outside it leaves nothing. A map
+ * relay's first such failure since it was last established runs a full report at once (no report
+ * per failed redial), so a home relay that answers probes
  * but refuses its connection is replaced within that report: on localhost about half a second; a
  * relay that drops packets instead holds the report up to its probe timeout (3 s) and its own
  * (5 s), then a dial to the new home follows. A probe that answers clears nothing; a connection
@@ -121,10 +125,13 @@ void wi_endpoint_key(const wi_endpoint *endpoint, uint8_t out_public_key[32]);
 /* Dials `public_key` through `relay_url` (any relay, in the map or not; NULL for none) and the
  * `address_count` direct addresses `addresses` ("ip:port", copied before return), at least one of
  * the two. iroh reaches a relay outside the map through a connection of its own, which it closes
- * after 60 s unused; the endpoint does not report it. A dial naming a relay whose latest
- * connection failed first ends that relay's redial backoff (as wi_endpoint_network_change does),
- * so its packets go out over a fresh connection now. OK: handles[0] is the wi_connection, bytes
- * the verified 32-byte key. ERROR or CLOSED: message. */
+ * after 60 s unused; the endpoint does not report it. At most 16 addresses: iroh sends to them
+ * while this dial is in flight and then for the connection it made, until that closes; another
+ * dial's addresses are its own. A dial naming a relay whose latest connection failed, once its
+ * arguments are valid, ends that relay's redial backoff, once until a connection to it is
+ * established, so its packets go out over a fresh connection now; no other relay is touched.
+ * OK: handles[0] is the wi_connection, bytes the verified 32-byte key. ERROR (more than 16
+ * addresses among them) or CLOSED: message. */
 uint64_t wi_endpoint_connect(const wi_endpoint *endpoint, const uint8_t public_key[32],
                              const char *relay_url, const char *const *addresses,
                              size_t address_count, wi_callback callback, void *context);
@@ -134,20 +141,25 @@ uint64_t wi_endpoint_connect(const wi_endpoint *endpoint, const uint8_t public_k
  * is closed. */
 uint64_t wi_endpoint_accept(const wi_endpoint *endpoint, wi_callback callback, void *context);
 
-/* Tells iroh the network may have changed: every relay connection is checked (a short-deadline
- * ping, a redial on silence) and every relay redial backoff ends. A dial an earlier check started
- * on the same interfaces is left alone for its whole budget (10 s, by wall-clock time); a dial is
- * restarted when the interfaces changed, when it is older than its budget, when it presents a
- * token the map no longer holds, or always with `after_suspension`, which the caller passes when
- * the device was just suspended (a short suspension can kill a dial's socket without moving the
- * clock far). OK when iroh has taken it in. */
+/* Tells iroh the network may have changed: every relay connection is checked (a ping with a short
+ * deadline that any frame from the relay answers, a redial on silence), and a relay that is not
+ * connected dials at once, ending its backoff or restarting its dial, unless a check on the same
+ * interfaces already did that within the last 10 s (wall-clock time) and no connection to it was
+ * established since. It always does when the interfaces changed, when its dial presents a token
+ * the map no longer holds, or with `after_suspension`, which the caller passes when the device was
+ * just suspended (a short suspension can kill a dial's socket without moving the clock far); a
+ * suspension is kept until each relay's next check takes it. A check whose deadline passes before
+ * the connection's first pong fails that attempt like a refusal: recorded, then backed off. OK
+ * when iroh has taken it in. */
 uint64_t wi_endpoint_network_change(const wi_endpoint *endpoint, bool after_suspension,
                                     wi_callback callback, void *context);
 
 typedef enum wi_relay_kind {
   /* The home relay, the one iroh keeps its standing connection to, and it is connected. */
   WI_RELAY_HOME_CONNECTED = 0,
-  /* The home relay, dialing; last_error is this relay's previous failure, empty when it has none. */
+  /* The home relay, dialing; last_error is its latest failed dial or upgrade since a connection
+   * to it was last established, NULL when none failed since (as after an established connection
+   * was lost). */
   WI_RELAY_HOME_CONNECTING = 1,
   /* The home relay, not connected; last_error says why (never empty). */
   WI_RELAY_HOME_DISCONNECTED = 2,
@@ -165,7 +177,7 @@ typedef enum wi_relay_kind {
 } wi_relay_kind;
 
 /* One relay of the map. url is the whole URL in iroh's form (a trailing slash); last_error is NULL
- * except for WI_RELAY_HOME_CONNECTING (NULL when the relay has not failed), WI_RELAY_HOME_DISCONNECTED
+ * except for WI_RELAY_HOME_CONNECTING (NULL when no attempt failed since it was established), WI_RELAY_HOME_DISCONNECTED
  * and WI_RELAY_FAILED; latency_micros is 0 except for WI_RELAY_REACHABLE. The strings belong to
  * the wi_relays the state came from and live until it is freed. */
 typedef struct wi_relay_state {

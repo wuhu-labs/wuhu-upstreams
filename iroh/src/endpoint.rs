@@ -7,15 +7,15 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
+use crate::op::{Outcome, RunOnce, guard, handle, key, runtime, spawn, text, wi_callback};
+use crate::stream::{RecvHandle, SendHandle};
+use crate::watch::wi_watch;
 use futures_util::StreamExt;
 use iroh::{
     Endpoint, EndpointAddr, PublicKey, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
     Watcher,
     endpoint::{Connection, ConnectionError, PortmapperConfig, VarInt, presets},
 };
-use crate::op::{Outcome, RunOnce, guard, handle, key, runtime, spawn, text, wi_callback};
-use crate::stream::{RecvHandle, SendHandle};
-use crate::watch::wi_watch;
 
 #[allow(non_camel_case_types)]
 pub struct wi_endpoint {
@@ -212,6 +212,10 @@ pub unsafe extern "C" fn wi_endpoint_key(endpoint: *const wi_endpoint, out: *mut
     })
 }
 
+/// How many addresses one `wi_endpoint_connect` may name: iroh keeps them, and sends to them,
+/// while that dial is in flight and then for the connection it made.
+const MAX_DIAL_ADDRESSES: usize = 16;
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wi_endpoint_connect(
     endpoint: *const wi_endpoint,
@@ -242,23 +246,16 @@ pub unsafe extern "C" fn wi_endpoint_connect(
             Err(e) => return Outcome::error(e),
         };
         let mut address = EndpointAddr::new(peer);
-        match relay {
-            Some(Ok(relay)) => {
-                // A relay whose last connection failed has its connection actor waiting out a
-                // redial backoff (up to 16 s): a check ends it, so the dial's packets go out
-                // over a fresh connection now.
-                let failed = endpoint
-                    .relay_upgrade_failures()
-                    .get()
-                    .iter()
-                    .any(|status| status.url() == &relay);
-                if failed {
-                    endpoint.network_change().await;
-                }
-                address = address.with_relay_url(relay);
-            }
+        let relay = match relay {
+            Some(Ok(relay)) => Some(relay),
             Some(Err(e)) => return Outcome::Error(e),
-            None => {}
+            None => None,
+        };
+        if addresses.len() > MAX_DIAL_ADDRESSES {
+            return Outcome::Error(format!(
+                "{} addresses to dial, at most {MAX_DIAL_ADDRESSES}",
+                addresses.len()
+            ));
         }
         for text in addresses {
             match text.parse::<SocketAddr>() {
@@ -266,8 +263,24 @@ pub unsafe extern "C" fn wi_endpoint_connect(
                 Err(e) => return Outcome::Error(format!("address {text}: {e}")),
             }
         }
+        if let Some(relay) = &relay {
+            address = address.with_relay_url(relay.clone());
+        }
         if address.is_empty() {
             return Outcome::Error("neither a relay URL nor an address to dial".into());
+        }
+        if let Some(relay) = &relay {
+            // A relay whose last connection failed has its connection actor waiting out a
+            // redial backoff (up to 16 s): a retry ends it, so the dial's packets go out over a
+            // fresh connection now. Only that relay's actor is touched.
+            let failed = endpoint
+                .relay_upgrade_failures()
+                .get()
+                .iter()
+                .any(|status| status.url() == relay);
+            if failed {
+                endpoint.retry_relay(relay).await;
+            }
         }
         match endpoint.connect(address, &alpn).await {
             Ok(connection) => {
@@ -714,22 +727,35 @@ pub unsafe extern "C" fn wi_connection_free(connection: *mut wi_connection) {
     guard((), || drop(unsafe { Box::from_raw(connection) }))
 }
 
-#[doc(hidden)]
+#[cfg(feature = "test-hooks")]
 pub unsafe fn net_reports(endpoint: *const c_void) -> u64 {
     let this = unsafe { &*(endpoint as *const wi_endpoint) };
     this.endpoint.metrics().net_report.reports.get()
 }
 
-/// Runs one full net report, as the periodic one does, and waits for it to start: a relay map
-/// write of an unchanged entry. Never part of the ABI, whose map writes are tokens only.
-#[doc(hidden)]
+#[cfg(feature = "test-hooks")]
 pub unsafe fn run_net_report(endpoint: *const c_void) {
-    let this = unsafe { &*(endpoint as *const wi_endpoint) };
-    let (endpoint, map) = (this.endpoint.clone(), this.map.clone());
+    let endpoint = unsafe { &*(endpoint as *const wi_endpoint) }
+        .endpoint
+        .clone();
     let runtime = runtime().expect("a runtime");
     runtime.block_on(async move {
-        if let Some(config) = map.relays::<Vec<_>>().into_iter().next() {
-            endpoint.insert_relay(config.url.clone(), config).await;
-        }
+        // Removing a relay the map doesn't hold changes no entry and no token, and asks for a
+        // full report as every map change does.
+        let absent: RelayUrl = "http://wuhu-iroh-report.invalid".parse().expect("a URL");
+        let full = || endpoint.metrics().net_report.reports_full.get();
+        let wait_for = |count: u64| async move {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+            while full() < count {
+                assert!(tokio::time::Instant::now() < deadline, "no full net report");
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+        let before = full();
+        endpoint.remove_relay(&absent).await;
+        wait_for(before + 1).await;
+        // Reports run one at a time, so the next full one starts only once that one completed.
+        endpoint.remove_relay(&absent).await;
+        wait_for(before + 2).await;
     });
 }
