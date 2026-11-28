@@ -36,8 +36,8 @@ struct SendState {
     writer: Mutex<()>,
     /// Writes from their call to the return of their callback.
     writes: AtomicUsize,
-    /// Our own reset's code, set once noq took it. noq wakes no stop watcher for a local reset
-    /// and, once the reset is acknowledged, reports the stream like an acknowledged finish.
+    /// Our own reset's code, set under `stream`'s lock right after noq took it: noq ends a stop
+    /// watcher on a local reset as it does on an acknowledged finish, without the code.
     reset: watch::Sender<Option<u64>>,
 }
 
@@ -194,8 +194,6 @@ pub unsafe extern "C" fn wi_send_stopped(
             if let Some(code) = *reset.borrow_and_update() {
                 return Outcome::Reset(code);
             }
-            // noq keeps this watcher's entry until the stream finishes, is stopped or the
-            // connection ends: a stream waited on and then reset locally holds it until then.
             send.stream.stopped()
         };
         tokio::select! {
@@ -203,7 +201,10 @@ pub unsafe extern "C" fn wi_send_stopped(
             code = reset.wait_for(Option::is_some) => Outcome::Reset(code.map_or(0, |c| c.unwrap_or(0))),
             stop = stopped => match stop {
                 Ok(Some(code)) => Outcome::Stopped(code.into_inner()),
-                Ok(None) => Outcome::Finished,
+                Ok(None) => {
+                    let _send = state.lock();
+                    state.reset.borrow().map_or(Outcome::Finished, Outcome::Reset)
+                }
                 Err(StoppedError::ConnectionLost(e)) => Outcome::Closed(e.to_string()),
                 Err(e) => Outcome::Closed(e.to_string()),
             },

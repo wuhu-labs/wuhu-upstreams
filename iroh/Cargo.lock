@@ -1356,8 +1356,7 @@ checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 [[package]]
 name = "iroh"
 version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40ac5d8330439176254581b6db4bc6f1d947d7cc741fda4e04b96d758addf1db"
+source = "git+https://github.com/wuhu-labs/iroh?rev=327dc811f2331e1b63084794bd2ac2757503a638#327dc811f2331e1b63084794bd2ac2757503a638"
 dependencies = [
  "backon",
  "blake3",
@@ -1406,8 +1405,7 @@ dependencies = [
 [[package]]
 name = "iroh-base"
 version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eff8f9146946feac461ef2e5fcf7b4b795eff44958ef6faa85cba3cecea62ab3"
+source = "git+https://github.com/wuhu-labs/iroh?rev=327dc811f2331e1b63084794bd2ac2757503a638#327dc811f2331e1b63084794bd2ac2757503a638"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -1426,8 +1424,7 @@ dependencies = [
 [[package]]
 name = "iroh-dns"
 version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2cf4ac424ab7e13357c7bff7b6320b865e6ffc2320d726b58d1c8162f52a1406"
+source = "git+https://github.com/wuhu-labs/iroh?rev=327dc811f2331e1b63084794bd2ac2757503a638#327dc811f2331e1b63084794bd2ac2757503a638"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -1484,8 +1481,7 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aef6e9c979c78b0dadf6a2aac4ff629c4ffb91ec34586275673524248dc72f55"
+source = "git+https://github.com/wuhu-labs/iroh?rev=327dc811f2331e1b63084794bd2ac2757503a638#327dc811f2331e1b63084794bd2ac2757503a638"
 dependencies = [
  "blake3",
  "bytes",
@@ -1950,8 +1946,7 @@ dependencies = [
 [[package]]
 name = "noq"
 version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c2cf8bf3b78c2684a8485782c3357344416f264050f8d08a06c45c4642d87a2"
+source = "git+https://github.com/wuhu-labs/noq?rev=08630983dfc63b40101b8c50544f11fde23ee1fd#08630983dfc63b40101b8c50544f11fde23ee1fd"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -1972,8 +1967,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "afb15c81d1f9b529d0c1f5095ee2e799eca9f361aa5f712424e758ce90f825d3"
+source = "git+https://github.com/wuhu-labs/noq?rev=08630983dfc63b40101b8c50544f11fde23ee1fd#08630983dfc63b40101b8c50544f11fde23ee1fd"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -2000,8 +1994,7 @@ dependencies = [
 [[package]]
 name = "noq-udp"
 version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "716df6621d528211d75608903c0dd54bee78745444cdcbb791bcfbc55717a29f"
+source = "git+https://github.com/wuhu-labs/noq?rev=08630983dfc63b40101b8c50544f11fde23ee1fd#08630983dfc63b40101b8c50544f11fde23ee1fd"
 dependencies = [
  "cfg_aliases",
  "libc",
