@@ -1356,7 +1356,7 @@ checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 [[package]]
 name = "iroh"
 version = "1.5.0"
-source = "git+https://github.com/wuhu-labs/iroh?rev=de269a80fe58ee2239923df682b9e9421c1c0810#de269a80fe58ee2239923df682b9e9421c1c0810"
+source = "git+https://github.com/wuhu-labs/iroh?rev=c68ada7db50abce7158c610d3011493ac1f469d6#c68ada7db50abce7158c610d3011493ac1f469d6"
 dependencies = [
  "backon",
  "blake3",
@@ -1405,7 +1405,7 @@ dependencies = [
 [[package]]
 name = "iroh-base"
 version = "1.5.0"
-source = "git+https://github.com/wuhu-labs/iroh?rev=de269a80fe58ee2239923df682b9e9421c1c0810#de269a80fe58ee2239923df682b9e9421c1c0810"
+source = "git+https://github.com/wuhu-labs/iroh?rev=c68ada7db50abce7158c610d3011493ac1f469d6#c68ada7db50abce7158c610d3011493ac1f469d6"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -1424,7 +1424,7 @@ dependencies = [
 [[package]]
 name = "iroh-dns"
 version = "1.5.0"
-source = "git+https://github.com/wuhu-labs/iroh?rev=de269a80fe58ee2239923df682b9e9421c1c0810#de269a80fe58ee2239923df682b9e9421c1c0810"
+source = "git+https://github.com/wuhu-labs/iroh?rev=c68ada7db50abce7158c610d3011493ac1f469d6#c68ada7db50abce7158c610d3011493ac1f469d6"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -1481,7 +1481,7 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "1.5.0"
-source = "git+https://github.com/wuhu-labs/iroh?rev=de269a80fe58ee2239923df682b9e9421c1c0810#de269a80fe58ee2239923df682b9e9421c1c0810"
+source = "git+https://github.com/wuhu-labs/iroh?rev=c68ada7db50abce7158c610d3011493ac1f469d6#c68ada7db50abce7158c610d3011493ac1f469d6"
 dependencies = [
  "blake3",
  "bytes",

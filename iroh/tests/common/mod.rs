@@ -44,7 +44,7 @@ pub const HOME_DISCONNECTED: u32 = 2;
 pub const REACHABLE: u32 = 3;
 pub const UNREACHABLE: u32 = 4;
 pub const UNPROBED: u32 = 5;
-pub const BENCHED: u32 = 6;
+pub const FAILED: u32 = 6;
 
 pub fn is_home(kind: u32) -> bool {
     kind <= HOME_DISCONNECTED

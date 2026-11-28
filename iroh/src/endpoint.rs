@@ -13,27 +13,19 @@ use iroh::{
     Watcher,
     endpoint::{Connection, ConnectionError, PortmapperConfig, VarInt, presets},
 };
-use tokio::task::AbortHandle;
-
-use crate::book::{Relays, TokenError};
-use crate::op::{Outcome, RunOnce, guard, handle, key, spawn, text, wi_callback};
+use crate::op::{Outcome, RunOnce, guard, handle, key, runtime, spawn, text, wi_callback};
 use crate::stream::{RecvHandle, SendHandle};
 use crate::watch::wi_watch;
 
 #[allow(non_camel_case_types)]
 pub struct wi_endpoint {
     endpoint: Endpoint,
-    relays: Arc<Relays>,
+    /// iroh's relay map, shared with the endpoint. Its URLs never change; `set_auth_token` is
+    /// its only write.
+    map: RelayMap,
     alpn: Vec<u8>,
     close: RunOnce<()>,
     connections: Arc<Mutex<Connections>>,
-    failover: AbortHandle,
-}
-
-impl Drop for wi_endpoint {
-    fn drop(&mut self) {
-        self.failover.abort();
-    }
 }
 
 /// The endpoint's connections, so that its close goes through each one's `Closer`.
@@ -159,18 +151,13 @@ pub unsafe extern "C" fn wi_endpoint_bind(
             builder = builder.clear_ip_transports();
         }
         match builder.bind().await {
-            Ok(endpoint) => {
-                let relays = Relays::new(endpoint.clone(), relays);
-                let failover = tokio::spawn(relays.clone().run()).abort_handle();
-                Outcome::Handle(handle(wi_endpoint {
-                    endpoint,
-                    relays,
-                    alpn,
-                    close: RunOnce::new(),
-                    connections: Default::default(),
-                    failover,
-                }))
-            }
+            Ok(endpoint) => Outcome::Handle(handle(wi_endpoint {
+                endpoint,
+                map: relays,
+                alpn,
+                close: RunOnce::new(),
+                connections: Default::default(),
+            })),
             Err(e) => Outcome::error(e),
         }
     })
@@ -184,7 +171,9 @@ pub unsafe extern "C" fn wi_endpoint_set_auth_token(
     callback: wi_callback,
     context: *mut c_void,
 ) -> u64 {
-    let relays = unsafe { &*endpoint }.relays.clone();
+    let this = unsafe { &*endpoint };
+    let endpoint = this.endpoint.clone();
+    let map = this.map.clone();
     let relay = relay_url(unsafe { text(relay_url_text) });
     let auth_token = unsafe { text(auth_token) };
     spawn(callback, context, async move {
@@ -192,14 +181,16 @@ pub unsafe extern "C" fn wi_endpoint_set_auth_token(
             Ok(relay) => relay,
             Err(e) => return Outcome::Error(e),
         };
-        let config = relay_config(relay.clone(), auth_token);
-        match relays.set_auth_token(&relay, config).await {
-            Ok(()) => Outcome::Ok,
-            Err(TokenError::NotInMap) => {
-                Outcome::Error(format!("relay URL {relay} is not in the endpoint's map"))
-            }
-            Err(TokenError::Closed) => Outcome::Closed("endpoint closed".into()),
+        if endpoint.is_closed() {
+            return Outcome::Closed("endpoint closed".into());
         }
+        if !map.contains(&relay) {
+            return Outcome::Error(format!("relay URL {relay} is not in the endpoint's map"));
+        }
+        // The relay's connection actor reads the map at every dial, and a check restarts a dial
+        // that presents a token the map no longer holds; a report would only cost time.
+        map.insert(relay.clone(), relay_config(relay, auth_token));
+        Outcome::Ok
     })
 }
 
@@ -235,7 +226,6 @@ pub unsafe extern "C" fn wi_endpoint_connect(
     let endpoint = this.endpoint.clone();
     let alpn = this.alpn.clone();
     let connections = this.connections.clone();
-    let relays = this.relays.clone();
     let peer = PublicKey::from_bytes(&unsafe { key(public_key) });
     let relay = unsafe { text(relay_url_text) }.map(|url| relay_url(Some(url)));
     let addresses: Vec<_> = if address_count == 0 {
@@ -254,7 +244,17 @@ pub unsafe extern "C" fn wi_endpoint_connect(
         let mut address = EndpointAddr::new(peer);
         match relay {
             Some(Ok(relay)) => {
-                relays.dialling(&relay).await;
+                // A relay whose last connection failed has its connection actor waiting out a
+                // redial backoff (up to 16 s): a check ends it, so the dial's packets go out
+                // over a fresh connection now.
+                let failed = endpoint
+                    .relay_upgrade_failures()
+                    .get()
+                    .iter()
+                    .any(|status| status.url() == &relay);
+                if failed {
+                    endpoint.network_change().await;
+                }
                 address = address.with_relay_url(relay);
             }
             Some(Err(e)) => return Outcome::Error(e),
@@ -318,12 +318,17 @@ pub unsafe extern "C" fn wi_endpoint_accept(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wi_endpoint_network_change(
     endpoint: *const wi_endpoint,
+    after_suspension: bool,
     callback: wi_callback,
     context: *mut c_void,
 ) -> u64 {
     let endpoint = unsafe { &*endpoint }.endpoint.clone();
     spawn(callback, context, async move {
-        endpoint.network_change().await;
+        if after_suspension {
+            endpoint.network_change_after_suspension().await;
+        } else {
+            endpoint.network_change().await;
+        }
         Outcome::Ok
     })
 }
@@ -338,7 +343,7 @@ pub enum wi_relay_kind {
     WI_RELAY_REACHABLE = 3,
     WI_RELAY_UNREACHABLE = 4,
     WI_RELAY_UNPROBED = 5,
-    WI_RELAY_BENCHED = 6,
+    WI_RELAY_FAILED = 6,
 }
 
 #[repr(C)]
@@ -371,19 +376,18 @@ pub unsafe extern "C" fn wi_endpoint_relays(endpoint: *const wi_endpoint) -> *mu
     guard(ptr::null_mut(), || {
         let home = this.endpoint.home_relay_status().get().into_iter().next();
         let report = this.endpoint.net_report().get();
-        let states = this
-            .relays
-            .entries()
-            .into_iter()
-            .map(|entry| {
-                let url = &entry.url;
+        // Relays whose latest connection failed before it was established: iroh passes them
+        // over as home while a report reached another relay.
+        let failures = this.endpoint.relay_upgrade_failures().get();
+        let mut urls: Vec<RelayUrl> = this.map.urls();
+        urls.sort();
+        let states = urls
+            .iter()
+            .map(|url| {
+                let failure = failures.iter().find(|status| status.url() == url);
                 let mut last_error = None;
                 let mut latency_micros = 0;
                 let kind = match (&home, &report) {
-                    (_, _) if entry.benched => {
-                        last_error = entry.last_error.clone();
-                        wi_relay_kind::WI_RELAY_BENCHED
-                    }
                     (Some(home), _) if home.url() == url => {
                         if home.is_connected() {
                             wi_relay_kind::WI_RELAY_HOME_CONNECTED
@@ -391,9 +395,24 @@ pub unsafe extern "C" fn wi_endpoint_relays(endpoint: *const wi_endpoint) -> *mu
                             last_error = Some(format!("{error:#}"));
                             wi_relay_kind::WI_RELAY_HOME_DISCONNECTED
                         } else {
-                            last_error = this.relays.last_error(url);
+                            // iroh drops the home's error once a redial starts; the record
+                            // keeps it until a connection is established.
+                            last_error = failure
+                                .and_then(|failure| failure.last_error())
+                                .map(|error| format!("{error:#}"));
                             wi_relay_kind::WI_RELAY_HOME_CONNECTING
                         }
+                    }
+                    (_, _) if failure.is_some() => {
+                        last_error = Some(
+                            failure
+                                .and_then(|failure| failure.last_error())
+                                .map_or_else(
+                                    || "connection failed before it was established".into(),
+                                    |error| format!("{error:#}"),
+                                ),
+                        );
+                        wi_relay_kind::WI_RELAY_FAILED
                     }
                     (_, None) => wi_relay_kind::WI_RELAY_UNPROBED,
                     (_, Some(report)) => match report
@@ -513,6 +532,11 @@ pub unsafe extern "C" fn wi_endpoint_watch(endpoint: *const wi_endpoint) -> *mut
                 .boxed(),
             endpoint
                 .watch_addr()
+                .stream_updates_only()
+                .map(|_| ())
+                .boxed(),
+            endpoint
+                .relay_upgrade_failures()
                 .stream_updates_only()
                 .map(|_| ())
                 .boxed(),
@@ -696,14 +720,16 @@ pub unsafe fn net_reports(endpoint: *const c_void) -> u64 {
     this.endpoint.metrics().net_report.reports.get()
 }
 
+/// Runs one full net report, as the periodic one does, and waits for it to start: a relay map
+/// write of an unchanged entry. Never part of the ABI, whose map writes are tokens only.
 #[doc(hidden)]
-pub unsafe fn failovers(endpoint: *const c_void) -> u64 {
+pub unsafe fn run_net_report(endpoint: *const c_void) {
     let this = unsafe { &*(endpoint as *const wi_endpoint) };
-    this.relays.failovers()
-}
-
-#[doc(hidden)]
-pub unsafe fn failover_gate(endpoint: *const c_void) -> Arc<tokio::sync::Mutex<()>> {
-    let this = unsafe { &*(endpoint as *const wi_endpoint) };
-    this.relays.gate()
+    let (endpoint, map) = (this.endpoint.clone(), this.map.clone());
+    let runtime = runtime().expect("a runtime");
+    runtime.block_on(async move {
+        if let Some(config) = map.relays::<Vec<_>>().into_iter().next() {
+            endpoint.insert_relay(config.url.clone(), config).await;
+        }
+    });
 }

@@ -316,53 +316,6 @@ fn with_every_relay_down_the_endpoint_runs_no_report_loop() {
     }
 }
 
-/// The home relay refuses the endpoint for a while, so its redials fail and each runs a net report,
-/// while its probes still answer: once it admits the endpoint again, the endpoint is back on it,
-/// not moved to the slower relay. The failure itself picks no relay; the report does.
-#[test]
-fn a_home_relay_that_comes_back_first_keeps_the_endpoint() {
-    let (relay_a, url_a) = spawn_relay_with(admit_unless_shut_out, record_gone);
-    let (relay_b, direct_b) = spawn_relay();
-    let url_b = slow_proxy(&direct_b);
-    let endpoint = bind_to(36, &[(&url_a, None), (&url_b, None)]);
-    assert!(eventually(Duration::from_secs(3), || connected_home(
-        endpoint
-    )
-    .is_some()));
-    assert_eq!(
-        connected_home(endpoint),
-        Some(reported(&url_a)),
-        "the nearer relay is home"
-    );
-    let key = key_of(endpoint);
-    let before = unsafe { wuhu_iroh::net_reports(endpoint) };
-    SHUT_OUT.lock().unwrap().push(key);
-    assert!(unsafe { wi_relay_disconnect(relay_a, key.as_ptr()) });
-    assert!(
-        eventually(Duration::from_secs(3), || unsafe {
-            wuhu_iroh::net_reports(endpoint)
-        } > before),
-        "a failed redial runs a report"
-    );
-    SHUT_OUT.lock().unwrap().retain(|k| *k != key);
-    assert!(
-        eventually(Duration::from_secs(3), || connected_home(endpoint)
-            .is_some()),
-        "connected again"
-    );
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(
-        connected_home(endpoint),
-        Some(reported(&url_a)),
-        "no forced move off a relay that came back"
-    );
-    close(endpoint);
-    unsafe {
-        wi_relay_free(relay_a);
-        wi_relay_free(relay_b);
-    }
-}
-
 #[test]
 fn a_relay_that_refuses_the_endpoint_is_redialled_with_backoff_only_and_each_redial_names_the_failure()
  {
@@ -384,11 +337,13 @@ fn a_relay_that_refuses_the_endpoint_is_redialled_with_backoff_only_and_each_red
                 assert!(!error.is_empty(), "disconnected without an error");
                 failed = true;
             }
-            HOME_CONNECTING if failed => {
+            // A redial can start before a sample sees the failure itself.
+            HOME_CONNECTING if failed || !error.is_empty() => {
                 assert!(!error.is_empty(), "a redial forgot the failure");
+                failed = true;
                 redialling += 1;
             }
-            HOME_CONNECTING => assert!(error.is_empty(), "{error}"),
+            HOME_CONNECTING => {}
             HOME_CONNECTED => panic!("connected to a relay that refuses"),
             _ => assert!(!failed, "no longer home after a failure"),
         }
@@ -502,25 +457,42 @@ fn direct_addresses_are_dialable_ones_and_a_dial_by_address_alone_connects() {
     unsafe { wi_relay_free(relay) };
 }
 
+/// Both relays answer every probe and refuse every connection. iroh redials each with its
+/// backoff, but runs a report only for a relay's first failure since it last connected: no
+/// report per failed dial. With only failing relays reached, the oldest failure is home, so the
+/// home moves off the first relay to fail and back to it once the other has failed too.
 #[test]
-fn relays_that_refuse_every_dial_start_failovers_at_a_doubling_gap_only() {
-    let refusing = || {
-        spawn_relay_access(Access {
-            context: ptr::null_mut(),
-            on_connect: Some(deny),
-            on_disconnect: None,
-            release: None,
-        })
-    };
-    let (relay_a, url_a) = refusing();
-    let (relay_b, url_b) = refusing();
+fn relays_that_refuse_every_dial_run_a_report_per_first_failure_only_and_trade_home() {
+    let (relay_a, url_a, seen_a) = door_relay(|_, _| false);
+    let (relay_b, url_b, seen_b) = door_relay(|_, _| false);
     let endpoint = bind_to(41, &[(&url_a, None), (&url_b, None)]);
-    std::thread::sleep(Duration::from_secs(4));
-    let failovers = unsafe { wuhu_iroh::failovers(endpoint) };
+    let key = key_of(endpoint);
+    let mut homes: Vec<String> = Vec::new();
+    let until = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < until {
+        if let Some(home) = relays(endpoint).into_iter().find(|s| is_home(s.kind)) {
+            if homes.last() != Some(&home.url()) {
+                homes.push(home.url());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let reports = unsafe { wuhu_iroh::net_reports(endpoint) };
-    eprintln!("{failovers} failovers and {reports} net reports in 4 s, every dial refused");
-    // Gaps of 0.5, 1 and 2 s after the first: four by 3.5 s, however often iroh redials.
-    assert!((2..=4).contains(&failovers), "{failovers} failovers in 4 s");
+    let dials = seen_a.tokens(&key).len() + seen_b.tokens(&key).len();
+    eprintln!("{reports} net reports and {dials} refused dials in 8 s; homes {homes:?}");
+    // The bind's reports, then one per relay's first failure.
+    assert!(reports <= 6, "{reports} net reports in 8 s");
+    assert!(dials > reports as usize, "{dials} refused dials");
+    assert!(homes.len() >= 3, "the home went A, B, A (or B, A, B): {homes:?}");
+    assert_eq!(homes[0], homes[2], "{homes:?}");
+    for state in relays(endpoint) {
+        if is_home(state.kind) {
+            assert_ne!(state.kind, HOME_CONNECTED, "{state:?}");
+        } else {
+            assert_eq!(state.kind, FAILED, "{state:?}");
+            assert!(!state.last_error().is_empty(), "{state:?}");
+        }
+    }
     close(endpoint);
     unsafe {
         wi_relay_free(relay_a);
@@ -529,8 +501,8 @@ fn relays_that_refuse_every_dial_start_failovers_at_a_doubling_gap_only() {
 }
 
 /// The nearer relay answers every probe and refuses every connection, for good. The endpoint
-/// leaves it for the relay that admits it within the bound the SPEC names (3 s of failure, then
-/// one report), and stays there once the bench is over and the refusing relay is back in the map.
+/// leaves it for the relay that admits it within one report of its first failure, and stays
+/// there through later full reports, in which the refusing relay answers its probe again.
 #[test]
 fn a_home_relay_that_answers_probes_but_refuses_every_connection_loses_home_to_one_that_admits_and_for_good()
  {
@@ -545,25 +517,39 @@ fn a_home_relay_that_answers_probes_but_refuses_every_connection_loses_home_to_o
     let started = Instant::now();
     let endpoint = bind_to(42, &[(&url_a, None), (&url_b, None)]);
     assert!(
-        eventually(Duration::from_secs(6), || connected_home(endpoint)
+        eventually(Duration::from_secs(3), || connected_home(endpoint)
             == Some(reported(&url_b))),
-        "home {:?} after 6 s: {:?}",
+        "home {:?} after 3 s: {:?}",
         connected_home(endpoint),
         relays(endpoint)
     );
     eprintln!("home on B after {:?}", started.elapsed());
     let a = state_of(endpoint, &url_a);
-    assert_eq!(a.kind, BENCHED, "{a:?}");
+    assert_eq!(a.kind, FAILED, "{a:?}");
     assert!(!a.last_error().is_empty(), "{a:?}");
 
-    // The bench lasts 5 s; for 7 s the endpoint stays on B, and A is back in the map by then.
-    let until = Instant::now() + Duration::from_secs(7);
-    while Instant::now() < until {
-        assert_eq!(connected_home(endpoint), Some(reported(&url_b)));
-        std::thread::sleep(Duration::from_millis(50));
+    for _ in 0..3 {
+        let before = unsafe { wuhu_iroh::net_reports(endpoint) };
+        unsafe { wuhu_iroh::run_net_report(endpoint) };
+        assert!(
+            eventually(Duration::from_secs(3), || unsafe {
+                wuhu_iroh::net_reports(endpoint)
+            } > before),
+            "the report ran"
+        );
+        let until = Instant::now() + Duration::from_millis(700);
+        while Instant::now() < until {
+            assert_eq!(
+                connected_home(endpoint),
+                Some(reported(&url_b)),
+                "{:?}",
+                relays(endpoint)
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let a = state_of(endpoint, &url_a);
+        assert_eq!(a.kind, FAILED, "{a:?}");
     }
-    let a = state_of(endpoint, &url_a);
-    assert_ne!(a.kind, BENCHED, "the bench ended: {a:?}");
     close(endpoint);
     unsafe {
         wi_relay_free(relay_a);
@@ -571,10 +557,10 @@ fn a_home_relay_that_answers_probes_but_refuses_every_connection_loses_home_to_o
     }
 }
 
-/// A benched relay that admits the endpoint again is a relay of the map again once its bench is
-/// over: when the other relay goes down, it is home again.
+/// A relay that refused the endpoint and admits it again is home again once the other goes
+/// down, and stays home through a later report.
 #[test]
-fn a_benched_relay_that_admits_again_is_home_again_when_the_other_goes_down() {
+fn a_failed_relay_that_admits_again_is_home_again_when_the_other_goes_down() {
     let (relay_a, url_a) = spawn_relay_with(admit_unless_shut_out, record_gone);
     let (relay_b, direct_b) = spawn_relay();
     let url_b = slow_proxy(&direct_b);
@@ -582,18 +568,13 @@ fn a_benched_relay_that_admits_again_is_home_again_when_the_other_goes_down() {
     SHUT_OUT.lock().unwrap().push(key);
     let endpoint = bind_to(43, &[(&url_a, None), (&url_b, None)]);
     assert!(
-        eventually(Duration::from_secs(6), || connected_home(endpoint)
+        eventually(Duration::from_secs(3), || connected_home(endpoint)
             == Some(reported(&url_b))),
         "home {:?}: {:?}",
         connected_home(endpoint),
         relays(endpoint)
     );
     SHUT_OUT.lock().unwrap().retain(|k| *k != key);
-    assert!(
-        eventually(Duration::from_secs(8), || state_of(endpoint, &url_a).kind
-            != BENCHED),
-        "the bench of A never ended"
-    );
     shut_down(relay_b);
     assert!(
         eventually(Duration::from_secs(6), || connected_home(endpoint)
@@ -602,85 +583,17 @@ fn a_benched_relay_that_admits_again_is_home_again_when_the_other_goes_down() {
         connected_home(endpoint),
         relays(endpoint)
     );
+    unsafe { wuhu_iroh::run_net_report(endpoint) };
+    let until = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < until {
+        assert_eq!(connected_home(endpoint), Some(reported(&url_a)));
+        std::thread::sleep(Duration::from_millis(20));
+    }
     close(endpoint);
     unsafe {
         wi_relay_free(relay_a);
         wi_relay_free(relay_b);
     }
-}
-
-fn shut_out_unless_good(key: &[u8; 32], _: Option<&str>) -> bool {
-    !SHUT_OUT.lock().unwrap().contains(key)
-}
-
-/// A token change lands while a failover holds its relay's entry between reading and writing
-/// it: the next connection presents the changed token (or none, for a removal), not the one
-/// the failover read.
-fn a_token_change_during_a_failover_holds(seed: u8, change: Option<&str>) {
-    let (relay, url, seen) = door_relay(shut_out_unless_good);
-    let first = CString::new("first").unwrap();
-    let endpoint = bind_to(seed, &[(&url, Some(&first))]);
-    let key = key_of(endpoint);
-    assert!(eventually(Duration::from_secs(3), || connected_home(
-        endpoint
-    )
-    .is_some()));
-
-    let gate = unsafe { wuhu_iroh::failover_gate(endpoint) };
-    let held = gate.blocking_lock();
-    let before = unsafe { wuhu_iroh::failovers(endpoint) };
-    SHUT_OUT.lock().unwrap().push(key);
-    assert!(unsafe { wi_relay_disconnect(relay, key.as_ptr()) });
-    assert!(
-        eventually(Duration::from_secs(3), || unsafe {
-            wuhu_iroh::failovers(endpoint)
-        } > before),
-        "no failover started"
-    );
-    // The failover read the entry and waits at the gate while the token changes.
-    let token = change.map(|t| CString::new(t).unwrap());
-    let token_ptr = token.as_ref().map_or(ptr::null(), |t| t.as_ptr());
-    let changed = call(|cb, cx| unsafe {
-        wi_endpoint_set_auth_token(endpoint, url.as_ptr(), token_ptr, cb, cx)
-    });
-    std::thread::sleep(Duration::from_millis(300));
-    // The relay admits the endpoint again before the failover writes, so its write is the
-    // last one before the endpoint connects: no later failover rewrites the entry.
-    SHUT_OUT.lock().unwrap().retain(|k| *k != key);
-    drop(held);
-    ok(changed);
-    assert!(
-        eventually(Duration::from_secs(20), || connected_home(endpoint)
-            .is_some()),
-        "not connected again"
-    );
-
-    let dials = seen.tokens(&key).len();
-    assert!(eventually(Duration::from_secs(3), || unsafe {
-        wi_relay_disconnect(relay, key.as_ptr())
-    }));
-    assert!(eventually(Duration::from_secs(5), || seen
-        .tokens(&key)
-        .len()
-        > dials));
-    assert_eq!(
-        seen.tokens(&key).last().cloned().flatten().as_deref(),
-        change,
-        "{:?}",
-        seen.tokens(&key)
-    );
-    close(endpoint);
-    unsafe { wi_relay_free(relay) };
-}
-
-#[test]
-fn a_token_replaced_during_a_failover_is_the_one_the_next_connection_presents() {
-    a_token_change_during_a_failover_holds(44, Some("second"));
-}
-
-#[test]
-fn a_token_removed_during_a_failover_is_not_presented_again() {
-    a_token_change_during_a_failover_holds(45, None);
 }
 
 #[test]
@@ -741,10 +654,59 @@ fn good_token_only(_: &[u8; 32], token: Option<&str>) -> bool {
     token == Some("good")
 }
 
-/// A relay benched for refusing the endpoint's token gets a new token, which waits for the
-/// bench to end; a dial naming that relay ends the bench, and the dial presents the new token.
+/// A relay that refused the endpoint admits it again while the endpoint stays home on the other:
+/// its next redial connects, which ends its failure. Nothing else changes (no report, the same
+/// home), and the states watch fires all the same.
 #[test]
-fn a_dial_naming_a_benched_relay_ends_the_bench_with_its_current_token() {
+fn a_failed_relay_that_connects_again_wakes_the_states_watch_with_no_report_or_home_change() {
+    let (relay_a, url_a) = spawn_relay_with(admit_unless_shut_out, record_gone);
+    let (relay_b, direct_b) = spawn_relay();
+    let url_b = slow_proxy(&direct_b);
+    let key = public_key(44);
+    SHUT_OUT.lock().unwrap().push(key);
+    let endpoint = bind_to(44, &[(&url_a, None), (&url_b, None)]);
+    assert!(
+        eventually(Duration::from_secs(3), || connected_home(endpoint)
+            == Some(reported(&url_b))),
+        "home {:?}: {:?}",
+        connected_home(endpoint),
+        relays(endpoint)
+    );
+    assert_eq!(state_of(endpoint, &url_a).kind, FAILED);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let watch = unsafe { wi_endpoint_watch(endpoint) };
+    let reports = unsafe { wuhu_iroh::net_reports(endpoint) };
+    SHUT_OUT.lock().unwrap().retain(|k| *k != key);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let next = call(|cb, cx| unsafe { wi_watch_next(watch, cb, cx) });
+        let fired = next
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|_| panic!("no states change in 5 s: {:?}", relays(endpoint)));
+        assert_eq!(fired.status, 0, "{fired:?}");
+        if state_of(endpoint, &url_a).kind != FAILED {
+            break;
+        }
+    }
+    assert_eq!(connected_home(endpoint), Some(reported(&url_b)));
+    assert_eq!(
+        unsafe { wuhu_iroh::net_reports(endpoint) },
+        reports,
+        "no report ran"
+    );
+    unsafe { wi_watch_free(watch) };
+    close(endpoint);
+    unsafe {
+        wi_relay_free(relay_a);
+        wi_relay_free(relay_b);
+    }
+}
+
+/// A relay that refused the endpoint's token gets a new token; a dial naming that relay goes
+/// out at once, not after the relay's redial backoff, and presents the new token.
+#[test]
+fn a_dial_naming_a_failed_relay_connects_at_once_with_its_current_token() {
     let (relay_a, url_a, seen_a) = door_relay(good_token_only);
     let (relay_b, direct_b) = spawn_relay();
     let url_b = slow_proxy(&direct_b);
@@ -759,32 +721,36 @@ fn a_dial_naming_a_benched_relay_ends_the_bench_with_its_current_token() {
         "{:?}",
         relays(endpoint)
     );
-    assert_eq!(state_of(endpoint, &url_a).kind, BENCHED);
+    assert_eq!(state_of(endpoint, &url_a).kind, FAILED);
+    // iroh doubles A's redial delay from 10 ms at each refusal: after the ninth it waits 2.56 s
+    // or more, longer than the dial's bound.
+    assert!(
+        eventually(Duration::from_secs(10), || seen_a.tokens(&key).len() >= 9),
+        "{} refusals",
+        seen_a.tokens(&key).len()
+    );
 
     ok(call(|cb, cx| unsafe {
         wi_endpoint_set_auth_token(endpoint, url_a.as_ptr(), good.as_ptr(), cb, cx)
     }));
-    std::thread::sleep(Duration::from_millis(300));
     assert_eq!(
         state_of(endpoint, &url_a).kind,
-        BENCHED,
-        "a token change leaves the bench alone"
+        FAILED,
+        "a token change alone connects nothing"
     );
 
     let accepted = call(|cb, cx| unsafe { wi_endpoint_accept(peer, cb, cx) });
     let started = std::time::Instant::now();
     let outgoing = ok(dial(endpoint, &key_of(peer), &url_a)).handles[0] as *mut c_void;
     let incoming = ok(accepted).handles[0] as *mut c_void;
-    // Well inside the bench's 5 s: the dial did not wait for the bench to run out.
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "the dial took {:?}",
         started.elapsed()
     );
-    assert_ne!(
-        state_of(endpoint, &url_a).kind,
-        BENCHED,
-        "the dial ended the bench"
+    assert!(
+        eventually(Duration::from_secs(1), || state_of(endpoint, &url_a).kind != FAILED),
+        "the dial's connection to A ended its failure"
     );
     assert_eq!(
         seen_a.tokens(&key).last().cloned().flatten().as_deref(),
