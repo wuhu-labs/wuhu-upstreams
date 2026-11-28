@@ -1946,7 +1946,7 @@ dependencies = [
 [[package]]
 name = "noq"
 version = "1.5.0"
-source = "git+https://github.com/wuhu-labs/noq?rev=08630983dfc63b40101b8c50544f11fde23ee1fd#08630983dfc63b40101b8c50544f11fde23ee1fd"
+source = "git+https://github.com/wuhu-labs/noq?rev=541fd04653043f307175a4ef2d109853788a1316#541fd04653043f307175a4ef2d109853788a1316"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -1967,7 +1967,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.5.0"
-source = "git+https://github.com/wuhu-labs/noq?rev=08630983dfc63b40101b8c50544f11fde23ee1fd#08630983dfc63b40101b8c50544f11fde23ee1fd"
+source = "git+https://github.com/wuhu-labs/noq?rev=541fd04653043f307175a4ef2d109853788a1316#541fd04653043f307175a4ef2d109853788a1316"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -1994,7 +1994,7 @@ dependencies = [
 [[package]]
 name = "noq-udp"
 version = "1.5.0"
-source = "git+https://github.com/wuhu-labs/noq?rev=08630983dfc63b40101b8c50544f11fde23ee1fd#08630983dfc63b40101b8c50544f11fde23ee1fd"
+source = "git+https://github.com/wuhu-labs/noq?rev=541fd04653043f307175a4ef2d109853788a1316#541fd04653043f307175a4ef2d109853788a1316"
 dependencies = [
  "cfg_aliases",
  "libc",

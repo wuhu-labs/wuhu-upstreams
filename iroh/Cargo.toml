@@ -30,6 +30,6 @@ strip = "debuginfo"
 iroh = { git = "https://github.com/wuhu-labs/iroh", rev = "de269a80fe58ee2239923df682b9e9421c1c0810" }
 iroh-base = { git = "https://github.com/wuhu-labs/iroh", rev = "de269a80fe58ee2239923df682b9e9421c1c0810" }
 iroh-relay = { git = "https://github.com/wuhu-labs/iroh", rev = "de269a80fe58ee2239923df682b9e9421c1c0810" }
-noq = { git = "https://github.com/wuhu-labs/noq", rev = "08630983dfc63b40101b8c50544f11fde23ee1fd" }
-noq-proto = { git = "https://github.com/wuhu-labs/noq", rev = "08630983dfc63b40101b8c50544f11fde23ee1fd" }
-noq-udp = { git = "https://github.com/wuhu-labs/noq", rev = "08630983dfc63b40101b8c50544f11fde23ee1fd" }
+noq = { git = "https://github.com/wuhu-labs/noq", rev = "541fd04653043f307175a4ef2d109853788a1316" }
+noq-proto = { git = "https://github.com/wuhu-labs/noq", rev = "541fd04653043f307175a4ef2d109853788a1316" }
+noq-udp = { git = "https://github.com/wuhu-labs/noq", rev = "541fd04653043f307175a4ef2d109853788a1316" }
