@@ -9,7 +9,8 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 kind=$1
 out=$(mkdir -p "$2" && cd "$2" && pwd)
-version=$(sed -n 's/^iroh = "=\(.*\)"/\1/p' "$here/Cargo.toml")
+version=$(sed -n 's/^iroh = .*"=\([0-9.]*\)".*/\1/p' "$here/Cargo.toml")
+test -n "$version"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 cd "$here"
