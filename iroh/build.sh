@@ -14,17 +14,30 @@ test -n "$version"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 cd "$here"
+target_dir=${CARGO_TARGET_DIR:-$here/target}
 
 stage="$work/stage"
 mkdir -p "$stage/include"
 cp "$here/include/wuhu_iroh.h" "$here/include/module.modulemap" "$stage/include/"
 cp "$here/PROVENANCE.md" "$here/Cargo.lock" "$stage/"
 
-# archive <rust target>: prints the archive's path and the native libraries it needs
+# archive <rust target>: builds the archive of one slice and copies it to $work/lib/<target>, the
+# only archive packaged; prints the native libraries it needs. The target directory may be reused
+# (CI caches it), so the archive an earlier build left there is removed first, and a failed build
+# fails the script.
 archive() {
-  RUSTFLAGS="--print=native-static-libs" cargo build --locked --release --target "$1" --lib 2>&1 |
-    grep -E 'native-static-libs|error|warning' || true
-  test -f "target/$1/release/libwuhu_iroh.a"
+  built="$target_dir/$1/release/libwuhu_iroh.a"
+  rm -f "$built"
+  if ! RUSTFLAGS="--print=native-static-libs" cargo build --locked --release --target "$1" --lib \
+    >"$work/build-$1.log" 2>&1; then
+    cat "$work/build-$1.log" >&2
+    echo "cargo build --target $1 failed" >&2
+    exit 1
+  fi
+  grep -E 'native-static-libs|warning' "$work/build-$1.log" || true
+  test -f "$built" || { echo "cargo build --target $1 wrote no $built" >&2; exit 1; }
+  mkdir -p "$work/lib/$1"
+  cp "$built" "$work/lib/$1/"
 }
 
 case "$kind" in
@@ -35,9 +48,9 @@ apple)
     archive "$t"
   done
   xcodebuild -create-xcframework \
-    -library target/aarch64-apple-darwin/release/libwuhu_iroh.a -headers "$stage/include" \
-    -library target/aarch64-apple-ios/release/libwuhu_iroh.a -headers "$stage/include" \
-    -library target/aarch64-apple-ios-sim/release/libwuhu_iroh.a -headers "$stage/include" \
+    -library "$work/lib/aarch64-apple-darwin/libwuhu_iroh.a" -headers "$stage/include" \
+    -library "$work/lib/aarch64-apple-ios/libwuhu_iroh.a" -headers "$stage/include" \
+    -library "$work/lib/aarch64-apple-ios-sim/libwuhu_iroh.a" -headers "$stage/include" \
     -output "$work/apple/CIroh.xcframework"
   cp "$here/PROVENANCE.md" "$here/Cargo.lock" "$work/apple/"
   (cd "$work/apple" && zip -qry "$out/iroh-$version-apple.zip" .)
@@ -47,7 +60,7 @@ linux)
   cargo test --locked --release
   archive x86_64-unknown-linux-gnu
   mkdir -p "$stage/lib"
-  cp target/x86_64-unknown-linux-gnu/release/libwuhu_iroh.a "$stage/lib/"
+  cp "$work/lib/x86_64-unknown-linux-gnu/libwuhu_iroh.a" "$stage/lib/"
   tar -czf "$out/iroh-$version-linux-x86_64.tar.gz" -C "$stage" .
   ;;
 *)
