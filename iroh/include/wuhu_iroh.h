@@ -180,8 +180,8 @@ void wi_send_reset(const wi_send *send, uint64_t code);
 /* STOPPED once the peer stops the stream: code. FINISHED once a finished stream's data is all
  * acknowledged. RESET, at once, when wi_send_reset abandoned the stream, before or while it waits:
  * its code. CLOSED when the connection is lost first: message. Any number may be pending; nothing
- * is registered with QUIC until one is. noq 1.5 keeps a stream's watcher until the stream finishes,
- * is stopped or the connection ends, so a stream waited on and then reset holds one until close. */
+ * is registered with QUIC until one is, and the registration ends with the stream (finished,
+ * stopped or reset) or its connection. */
 uint64_t wi_send_stopped(const wi_send *send, wi_callback callback, void *context);
 
 /* Drops the handle; a stream neither finished nor reset is reset with code 0. */
